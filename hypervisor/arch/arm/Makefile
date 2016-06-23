@@ -21,6 +21,7 @@ obj-y += traps.o mmio.o
 obj-y += paging.o mmu_hyp.o mmu_cell.o caches.o
 obj-y += psci.o psci_low.o smp.o
 obj-y += irqchip.o gic-common.o
+obj-y += pci.o ../../pci.o ../../ivshmem.o ivshmem.o
 obj-$(CONFIG_ARM_GIC_V3) += gic-v3.o
 obj-$(CONFIG_ARM_GIC) += gic-v2.o
 obj-$(CONFIG_SERIAL_AMBA_PL011) += dbg-write-pl011.o

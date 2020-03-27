@@ -23,7 +23,6 @@
 #define PCI_CFG_STATUS		0x06
 # define PCI_STS_CAPS		(1 << 4)
 #define PCI_CFG_BAR		0x10
-# define PCI_BAR_64BIT		0x4
 #define PCI_CFG_BAR_END		0x27
 #define PCI_CFG_ROMBAR		0x30
 #define PCI_CFG_CAPS		0x34
@@ -33,14 +32,12 @@
 
 #define PCI_NUM_BARS		6
 
-#define PCI_DEV_CLASS_MEM	0x05
-
-#define PCI_CAP_MSI		0x05
-#define PCI_CAP_MSIX		0x11
+#define PCI_DEV_CLASS_OTHER	0xff
 
 #define PCI_IVSHMEM_NUM_MMIO_REGIONS	2
 
 struct cell;
+struct ivshmem_endpoint;
 
 /**
  * @defgroup PCI PCI Subsystem
@@ -103,6 +100,8 @@ union pci_msix_registers {
 	/** @publicsection */
 } __attribute__((packed));
 
+#define PCI_MSIX_CTRL_RW_MASK	(BIT_MASK(15, 14) << 16)
+
 /** MSI-X table entry. See PCI specification. */
 union pci_msix_vector {
 	/** @privatesection */
@@ -135,7 +134,7 @@ struct pci_device {
 	/** Shadow state of MSI-X config space registers. */
 	union pci_msix_registers msix_registers;
 	/** ivshmem specific data. */
-	struct pci_ivshmem_endpoint *ivshmem_endpoint;
+	struct ivshmem_endpoint *ivshmem_endpoint;
 	/** Real MSI-X table. */
 	union pci_msix_vector *msix_table;
 	/** Shadow state of MSI-X table. */
@@ -143,10 +142,6 @@ struct pci_device {
 	/** Buffer for shadow table of up to PCI_EMBEDDED_MSIX_VECTS vectors. */
 	union pci_msix_vector msix_vector_array[PCI_EMBEDDED_MSIX_VECTS];
 };
-
-unsigned int pci_mmio_count_regions(struct cell *cell);
-
-int pci_init(void);
 
 u32 pci_read_config(u16 bdf, u16 address, unsigned int size);
 void pci_write_config(u16 bdf, u16 address, u32 value, unsigned int size);
@@ -158,15 +153,15 @@ enum pci_access pci_cfg_read_moderate(struct pci_device *device, u16 address,
 enum pci_access pci_cfg_write_moderate(struct pci_device *device, u16 address,
 				       unsigned int size, u32 value);
 
-int pci_cell_init(struct cell *cell);
-void pci_cell_exit(struct cell *cell);
+void pci_reset_device(struct pci_device *device);
+
+void pci_cell_reset(struct cell *cell);
 
 void pci_config_commit(struct cell *cell_added_removed);
 
 unsigned int pci_enabled_msi_vectors(struct pci_device *device);
 
 void pci_prepare_handover(void);
-void pci_shutdown(void);
 
 /**
  * Read from PCI config space via architecture-specific method.
@@ -213,12 +208,17 @@ int arch_pci_add_physical_device(struct cell *cell, struct pci_device *device);
 void arch_pci_remove_physical_device(struct pci_device *device);
 
 /**
- * Avoid MSI vector delivery of a given device.
+ * Avoid MSI vector delivery of a given device or re-enable it.
  * @param device	Device to be silenced.
  * @param cap		MSI capability of the device.
+ * @param suppress	True to disable delivery, false to allow it again.
+ *
+ * @note As events may be lost while a MSI vector is suppressed, re-enabling it
+ * may require injecting one event unconditionally.
  */
-void arch_pci_suppress_msi(struct pci_device *device,
-			   const struct jailhouse_pci_capability *cap);
+void arch_pci_set_suppress_msi(struct pci_device *device,
+			       const struct jailhouse_pci_capability *cap,
+			       bool suppress);
 
 /**
  * Update MSI vector mapping for a given device.
@@ -243,17 +243,5 @@ int arch_pci_update_msi(struct pci_device *device,
  */
 int arch_pci_update_msix_vector(struct pci_device *device, unsigned int index);
 
-/**
- * @defgroup PCI-IVSHMEM ivshmem
- * @{
- */
-int pci_ivshmem_init(struct cell *cell, struct pci_device *device);
-void pci_ivshmem_exit(struct pci_device *device);
-int pci_ivshmem_update_msix(struct pci_device *device);
-enum pci_access pci_ivshmem_cfg_write(struct pci_device *device,
-				      unsigned int row, u32 mask, u32 value);
-enum pci_access pci_ivshmem_cfg_read(struct pci_device *device, u16 address,
-				     u32 *value);
-/** @} PCI-IVSHMEM */
 /** @} PCI */
 #endif /* !_JAILHOUSE_PCI_H */

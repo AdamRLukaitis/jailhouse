@@ -10,12 +10,19 @@
  * the COPYING file in the top-level directory.
  */
 
-#include <asm/control.h>
-#include <asm/setup.h>
-#include <asm/setup_mmu.h>
-#include <asm/sysregs.h>
 #include <jailhouse/paging.h>
 #include <jailhouse/printk.h>
+#include <asm/entry.h>
+#include <asm/mmu_hyp.h>
+#include <asm/sysregs.h>
+
+/* This is only used if we use the new hyp-stub ABI that was introduced in
+ * 4.12-rc1 */
+#define LINUX_HVC_SET_VECTOR 0
+
+/* functions used for translating addresses during the MMU setup process */
+typedef void* (*phys2virt_t)(unsigned long);
+typedef unsigned long (*virt2phys_t)(volatile const void *);
 
 /*
  * Two identity mappings need to be created for enabling the MMU: one for the
@@ -31,8 +38,14 @@ static struct {
 
 extern unsigned long trampoline_start, trampoline_end;
 
-/* When disabling Jailhouse, we will need to restore the Linux stub */
-static unsigned long saved_vectors = 0;
+static inline unsigned int hvc(unsigned int r0, unsigned int r1)
+{
+	register unsigned int __r0 asm("r0") = r0;
+	register unsigned int __r1 asm("r1") = r1;
+
+	asm volatile("hvc #0" : "=r" (__r0) : "r" (__r0), "r" (__r1));
+	return __r0;
+}
 
 static int set_id_map(int i, unsigned long address, unsigned long size)
 {
@@ -41,7 +54,7 @@ static int set_id_map(int i, unsigned long address, unsigned long size)
 
 	/* The trampoline code should be contained in one page. */
 	if ((address & PAGE_MASK) != ((address + size - 1) & PAGE_MASK)) {
-		printk("FATAL: Unable to IDmap more than one page at at time.\n");
+		printk("FATAL: Unable to IDmap more than one page at a time.\n");
 		return -E2BIG;
 	}
 
@@ -52,13 +65,13 @@ static int set_id_map(int i, unsigned long address, unsigned long size)
 	return 0;
 }
 
-static void create_id_maps(void)
+static void create_id_maps(struct paging_structures *pg_structs)
 {
 	unsigned long i;
 	bool conflict;
 
 	for (i = 0; i < ARRAY_SIZE(id_maps); i++) {
-		conflict = (paging_virt2phys(&hv_paging_structs,
+		conflict = (paging_virt2phys(pg_structs,
 				id_maps[i].addr, PAGE_PRESENT_FLAGS) !=
 				INVALID_PHYS_ADDR);
 		if (conflict) {
@@ -68,15 +81,15 @@ static void create_id_maps(void)
 			 * This extraction should be implemented in the core.
 			 */
 		} else {
-			paging_create(&hv_paging_structs, id_maps[i].addr,
-				PAGE_SIZE, id_maps[i].addr, id_maps[i].flags,
-				PAGING_NON_COHERENT);
+			paging_create(pg_structs, id_maps[i].addr, PAGE_SIZE,
+				      id_maps[i].addr, id_maps[i].flags,
+				      PAGING_NON_COHERENT | PAGING_NO_HUGE);
 		}
 		id_maps[i].conflict = conflict;
 	}
 }
 
-static void destroy_id_maps(void)
+static void destroy_id_maps(struct paging_structures *pg_structs)
 {
 	unsigned long i;
 
@@ -84,23 +97,16 @@ static void destroy_id_maps(void)
 		if (id_maps[i].conflict) {
 			/* TODO: Switch back to the original flags */
 		} else {
-			paging_destroy(&hv_paging_structs, id_maps[i].addr,
+			paging_destroy(pg_structs, id_maps[i].addr,
 				       PAGE_SIZE, PAGING_NON_COHERENT);
 		}
 	}
 }
 
-static void __attribute__((naked)) __attribute__((noinline))
-cpu_switch_el2(unsigned long phys_bootstrap, virt2phys_t virt2phys)
+static void __attribute__((naked, noinline))
+cpu_switch_el2(virt2phys_t virt2phys)
 {
 	asm volatile(
-		/*
-		 * The linux hyp stub allows to install the vectors with a
-		 * single hvc. The vector base address is in r0
-		 * (phys_bootstrap).
-		 */
-		"hvc	#0\n\t"
-
 		/*
 		 * Now that the bootstrap vectors are installed, call setup_el2
 		 * with the translated physical values of lr and sp as
@@ -134,8 +140,8 @@ cpu_switch_el2(unsigned long phys_bootstrap, virt2phys_t virt2phys)
  * Those two registers are thus supposed to be left intact by the whole MMU
  * setup. The stack is all the same usable, since it is id-mapped as well.
  */
-static void __attribute__((naked)) __attribute__((section(".trampoline")))
-setup_mmu_el2(struct per_cpu *cpu_data, phys2virt_t phys2virt, u64 ttbr)
+static void __attribute__((naked, section(".trampoline")))
+setup_mmu_el2(unsigned long phys_cpu_data, phys2virt_t phys2virt, u64 ttbr)
 {
 	u32 tcr = T0SZ
 		| (TCR_RGN_WB_WA << TCR_IRGN0_SHIFT)
@@ -146,8 +152,7 @@ setup_mmu_el2(struct per_cpu *cpu_data, phys2virt_t phys2virt, u64 ttbr)
 
 	/* Ensure that MMU is disabled. */
 	arm_read_sysreg(SCTLR_EL2, sctlr_el2);
-	if (sctlr_el2 & SCTLR_M_BIT)
-		return;
+	arm_write_sysreg(SCTLR_EL2, sctlr_el2 & ~SCTLR_M_BIT);
 
 	/*
 	 * This setup code is always preceded by a complete cache flush, so
@@ -181,20 +186,27 @@ setup_mmu_el2(struct per_cpu *cpu_data, phys2virt_t phys2virt, u64 ttbr)
 	isb();
 
 	/*
-	 * Inlined epilogue that returns to switch_exception_level.
+	 * Epilogue that returns to switch_exception_level.
 	 * Must not touch anything else than the stack
 	 */
-	cpu_switch_phys2virt(phys2virt);
-
-	/* Not reached (cannot be a while(1), it confuses the compiler) */
-	asm volatile("b	.");
+	asm volatile(
+		/* Convert sp to per-cpu mapping */
+		"add	sp, %0\n\t"
+		/* Translate LR */
+		"mov	r0, lr\n\t"
+		"blx	%1\n\t"
+		/* Jump back to virtual addresses */
+		"bx	r0\n\t"
+		: : "r" (LOCAL_CPU_BASE - phys_cpu_data),
+		    "r" (phys2virt)
+		: "cc", "r0", "r1", "r2", "r3", "lr", "sp");
 }
 
 /*
  * Shutdown the MMU and returns to EL1 with the kernel context stored in `regs'
  */
-static void __attribute__((naked)) __attribute__((section(".trampoline")))
-shutdown_el2(struct registers *regs, unsigned long vectors)
+static void __attribute__((naked, section(".trampoline")))
+shutdown_el2(union registers *regs, unsigned long vectors)
 {
 	u32 sctlr_el2;
 
@@ -227,7 +239,7 @@ static void check_mmu_map(unsigned long virt_addr, unsigned long phys_addr)
 	arm_read_sysreg(PAR_EL1, par);
 	phys_base = (unsigned long)(par & PAR_PA_MASK);
 	if ((par & PAR_F_BIT) || (phys_base != phys_addr)) {
-		printk("VA->PA check failed, expected %x, got %x\n",
+		printk("VA->PA check failed, expected %lx, got %lx\n",
 				phys_addr, phys_base);
 		while (1);
 	}
@@ -242,18 +254,14 @@ static void check_mmu_map(unsigned long virt_addr, unsigned long phys_addr)
  */
 int switch_exception_level(struct per_cpu *cpu_data)
 {
-	extern unsigned long bootstrap_vectors;
-	extern unsigned long hyp_vectors;
-
 	/* Save the virtual address of the phys2virt function for later */
 	phys2virt_t phys2virt = paging_phys2hvirt;
 	virt2phys_t virt2phys = paging_hvirt2phys;
 	unsigned long phys_bootstrap = virt2phys(&bootstrap_vectors);
-	struct per_cpu *phys_cpu_data = (struct per_cpu *)virt2phys(cpu_data);
+	unsigned long phys_cpu_data = virt2phys(cpu_data);
 	unsigned long trampoline_phys = virt2phys((void *)&trampoline_start);
 	unsigned long trampoline_size = &trampoline_end - &trampoline_start;
-	unsigned long stack_virt = (unsigned long)cpu_data->stack;
-	unsigned long stack_phys = virt2phys((void *)stack_virt);
+	unsigned long stack_phys = virt2phys(cpu_data->stack);
 	u64 ttbr_el2;
 
 	/* Check the paging structures as well as the MMU initialisation */
@@ -262,18 +270,10 @@ int switch_exception_level(struct per_cpu *cpu_data)
 				 PAGE_DEFAULT_FLAGS);
 
 	/*
-	 * The hypervisor stub allows to fetch its current vector base by doing
-	 * an HVC with r0 = -1. They will need to be restored when disabling
-	 * jailhouse.
-	 */
-	if (saved_vectors == 0)
-		saved_vectors = hvc(-1);
-
-	/*
 	 * paging struct won't be easily accessible when initializing el2, only
 	 * the CPU datas will be readable at their physical address
 	 */
-	ttbr_el2 = (u64)virt2phys(hv_paging_structs.root_table) & TTBR_MASK;
+	ttbr_el2 = (u64)virt2phys(cpu_data->pg_structs.root_table) & TTBR_MASK;
 
 	/*
 	 * Mirror the mmu setup code, so that we are able to jump to the virtual
@@ -285,16 +285,29 @@ int switch_exception_level(struct per_cpu *cpu_data)
 		return -E2BIG;
 	if (set_id_map(1, stack_phys, PAGE_SIZE) != 0)
 		return -E2BIG;
-	create_id_maps();
+	create_id_maps(&cpu_data->pg_structs);
 
 	/*
 	 * Before doing anything hairy, we need to sync the caches with memory:
 	 * they will be off at EL2. From this point forward and until the caches
 	 * are re-enabled, we cannot write anything critical to memory.
 	 */
-	arch_cpu_dcaches_flush(CACHES_CLEAN);
+	arm_dcaches_clean_by_sw();
 
-	cpu_switch_el2(phys_bootstrap, virt2phys);
+	/* Replace Linux hyp-stubs by our own bootstrap vector table.
+	 *
+	 * Hyp-stub ABI semantic changed since 4.12-rc1 on ARM. To share the
+	 * hvc routine among both versions, we simply zero r1 which is
+	 * meaningless for the old ABI. The new ABI expects an opcode in r0 and
+	 * an argument in r1. See Linux
+	 * Documentation/virtual/kvm/arm/hyp-abi.txt .
+	 */
+	if (hypervisor_header.arm_linux_hyp_abi == HYP_STUB_ABI_LEGACY)
+		hvc(phys_bootstrap, 0);
+	else
+		hvc(LINUX_HVC_SET_VECTOR, phys_bootstrap);
+
+	cpu_switch_el2(virt2phys);
 	/*
 	 * At this point, we are at EL2, and we work with physical addresses.
 	 * The MMU needs to be initialised and execution must go back to virtual
@@ -310,24 +323,23 @@ int switch_exception_level(struct per_cpu *cpu_data)
 	arm_write_sysreg(HVBAR, &hyp_vectors);
 
 	/* Remove the identity mapping */
-	destroy_id_maps();
+	destroy_id_maps(&cpu_data->pg_structs);
 
 	return 0;
 }
 
 void __attribute__((noreturn)) arch_shutdown_mmu(struct per_cpu *cpu_data)
 {
-	static DEFINE_SPINLOCK(map_lock);
+	static spinlock_t map_lock;
 
 	virt2phys_t virt2phys = paging_hvirt2phys;
-	void *stack_virt = cpu_data->stack;
-	unsigned long stack_phys = virt2phys((void *)stack_virt);
+	unsigned long stack_phys = virt2phys(cpu_data->stack);
 	unsigned long trampoline_phys = virt2phys((void *)&trampoline_start);
-	struct registers *regs_phys =
-			(struct registers *)virt2phys(guest_regs(cpu_data));
+	union registers *regs_phys =
+			(union registers *)virt2phys(&cpu_data->guest_regs);
 
 	/* Jump to the identity-mapped trampoline page before shutting down */
-	void (*shutdown_fun_phys)(struct registers*, unsigned long);
+	void (*shutdown_fun_phys)(union registers*, unsigned long);
 	shutdown_fun_phys = (void*)virt2phys(shutdown_el2);
 
 	/*
@@ -337,13 +349,13 @@ void __attribute__((noreturn)) arch_shutdown_mmu(struct per_cpu *cpu_data)
 	 */
 	spin_lock(&map_lock);
 	paging_create(&hv_paging_structs, stack_phys, PAGE_SIZE, stack_phys,
-		      PAGE_DEFAULT_FLAGS, PAGING_NON_COHERENT);
+		      PAGE_DEFAULT_FLAGS, PAGING_NON_COHERENT | PAGING_NO_HUGE);
 	paging_create(&hv_paging_structs, trampoline_phys, PAGE_SIZE,
 		      trampoline_phys, PAGE_DEFAULT_FLAGS,
-		      PAGING_NON_COHERENT);
+		      PAGING_NON_COHERENT | PAGING_NO_HUGE);
 	spin_unlock(&map_lock);
 
-	arch_cpu_dcaches_flush(CACHES_CLEAN);
+	arm_dcaches_clean_by_sw();
 
 	/*
 	 * Final shutdown:
@@ -351,21 +363,22 @@ void __attribute__((noreturn)) arch_shutdown_mmu(struct per_cpu *cpu_data)
 	 * - reset the vectors
 	 * - return to EL1
 	 */
-	shutdown_fun_phys(regs_phys, saved_vectors);
+	shutdown_fun_phys(regs_phys, hypervisor_header.arm_linux_hyp_vectors);
 
 	__builtin_unreachable();
 }
 
-int arch_map_device(void *paddr, void *vaddr, unsigned long size)
+void arm_dcaches_flush(void *addr, long size, enum dcache_flush flush)
 {
-	return paging_create(&hv_paging_structs, (unsigned long)paddr, size,
-			(unsigned long)vaddr,
-			PAGE_DEFAULT_FLAGS | S1_PTE_FLAG_DEVICE,
-			PAGING_NON_COHERENT);
-}
-
-int arch_unmap_device(void *vaddr, unsigned long size)
-{
-	return paging_destroy(&hv_paging_structs, (unsigned long)vaddr, size,
-			PAGING_NON_COHERENT);
+	while (size > 0) {
+		/* clean / invalidate by MVA to PoC */
+		if (flush == DCACHE_CLEAN)
+			arm_write_sysreg(DCCMVAC, addr);
+		else if (flush == DCACHE_INVALIDATE)
+			arm_write_sysreg(DCIMVAC, addr);
+		else
+			arm_write_sysreg(DCCIMVAC, addr);
+		size -= MIN(cache_line_size, size);
+		addr += cache_line_size;
+	}
 }

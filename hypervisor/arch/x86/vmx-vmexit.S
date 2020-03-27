@@ -10,6 +10,7 @@
  * the COPYING file in the top-level directory.
  */
 
+#include <jailhouse/paging.h>
 #include <asm/asm-defines.h>
 
 /* VMX VM-exit handling */
@@ -32,7 +33,7 @@ vmx_vmexit:
 	push %r14
 	push %r15
 
-	lea -PERCPU_STACK_END+16*8(%rsp),%rdi
+	mov $LOCAL_CPU_BASE_ASM,%rdi
 	call vcpu_handle_exit
 
 	pop %r15

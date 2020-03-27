@@ -11,7 +11,6 @@
  */
 
 #include <jailhouse/control.h>
-#include <jailhouse/pci.h>
 #include <jailhouse/printk.h>
 #include <jailhouse/processor.h>
 #include <asm/apic.h>
@@ -33,46 +32,13 @@ struct exception_frame {
 
 int arch_cell_create(struct cell *cell)
 {
-	unsigned int cpu;
 	int err;
 
 	err = vcpu_cell_init(cell);
 	if (err)
 		return err;
 
-	err = iommu_cell_init(cell);
-	if (err)
-		goto error_vm_exit;
-
-	err = pci_cell_init(cell);
-	if (err)
-		goto error_iommu_exit;
-
-	err = ioapic_cell_init(cell);
-	if (err)
-		goto error_pci_exit;
-
-	err = cat_cell_init(cell);
-	if (err)
-		goto error_ioapic_exit;
-
-	cell->comm_page.comm_region.pm_timer_address =
-		system_config->platform_info.x86.pm_timer_address;
-	cell->comm_page.comm_region.num_cpus = 0;
-	for_each_cpu(cpu, cell->cpu_set)
-		cell->comm_page.comm_region.num_cpus++;
-
 	return 0;
-
-error_ioapic_exit:
-	ioapic_cell_exit(cell);
-error_pci_exit:
-	pci_cell_exit(cell);
-error_iommu_exit:
-	iommu_cell_exit(cell);
-error_vm_exit:
-	vcpu_cell_exit(cell);
-	return err;
 }
 
 int arch_map_memory_region(struct cell *cell,
@@ -110,103 +76,72 @@ void arch_flush_cell_vcpu_caches(struct cell *cell)
 		if (cpu == this_cpu_id()) {
 			vcpu_tlb_flush();
 		} else {
-			per_cpu(cpu)->flush_vcpu_caches = true;
+			public_per_cpu(cpu)->flush_vcpu_caches = true;
 			/* make sure the value is written before we kick
 			 * the remote core */
 			memory_barrier();
-			apic_send_nmi_ipi(per_cpu(cpu));
+			apic_send_nmi_ipi(public_per_cpu(cpu));
 		}
 }
 
 void arch_cell_destroy(struct cell *cell)
 {
-	cat_cell_exit(cell);
-	ioapic_cell_exit(cell);
-	pci_cell_exit(cell);
-	iommu_cell_exit(cell);
 	vcpu_cell_exit(cell);
+}
+
+void arch_cell_reset(struct cell *cell)
+{
+	struct jailhouse_comm_region *comm_region = &cell->comm_page.comm_region;
+	unsigned int cpu;
+
+	comm_region->pm_timer_address =
+		system_config->platform_info.x86.pm_timer_address;
+	/* comm_region, and hence num_cpus, is zero-initialised */
+	for_each_cpu(cpu, cell->cpu_set)
+		comm_region->num_cpus++;
+	comm_region->tsc_khz = system_config->platform_info.x86.tsc_khz;
+	comm_region->apic_khz = system_config->platform_info.x86.apic_khz;
+
+	ioapic_cell_reset(cell);
 }
 
 void arch_config_commit(struct cell *cell_added_removed)
 {
 	iommu_config_commit(cell_added_removed);
-	pci_config_commit(cell_added_removed);
 	ioapic_config_commit(cell_added_removed);
 }
 
-void arch_shutdown(void)
+void arch_prepare_shutdown(void)
 {
-	pci_prepare_handover();
 	ioapic_prepare_handover();
-
-	iommu_shutdown();
-	pci_shutdown();
-	ioapic_shutdown();
-}
-
-void arch_suspend_cpu(unsigned int cpu_id)
-{
-	struct per_cpu *target_data = per_cpu(cpu_id);
-	bool target_suspended;
-
-	spin_lock(&target_data->control_lock);
-
-	target_data->suspend_cpu = true;
-	target_suspended = target_data->cpu_suspended;
-
-	spin_unlock(&target_data->control_lock);
-
-	if (!target_suspended) {
-		apic_send_nmi_ipi(target_data);
-
-		while (!target_data->cpu_suspended)
-			cpu_relax();
-	}
-}
-
-void arch_resume_cpu(unsigned int cpu_id)
-{
-	struct per_cpu *target_data = per_cpu(cpu_id);
-
-	/* take lock to avoid theoretical race with a pending suspension */
-	spin_lock(&target_data->control_lock);
-
-	target_data->suspend_cpu = false;
-
-	spin_unlock(&target_data->control_lock);
+	iommu_prepare_shutdown();
 }
 
 void arch_reset_cpu(unsigned int cpu_id)
 {
-	per_cpu(cpu_id)->sipi_vector = APIC_BSP_PSEUDO_SIPI;
+	public_per_cpu(cpu_id)->sipi_vector = APIC_BSP_PSEUDO_SIPI;
 
-	arch_resume_cpu(cpu_id);
+	resume_cpu(cpu_id);
 }
 
 void arch_park_cpu(unsigned int cpu_id)
 {
-	per_cpu(cpu_id)->init_signaled = true;
+	public_per_cpu(cpu_id)->init_signaled = true;
 
-	arch_resume_cpu(cpu_id);
-}
-
-void arch_shutdown_cpu(unsigned int cpu_id)
-{
-	arch_suspend_cpu(cpu_id);
-	per_cpu(cpu_id)->shutdown_cpu = true;
-	arch_resume_cpu(cpu_id);
+	resume_cpu(cpu_id);
 }
 
 void x86_send_init_sipi(unsigned int cpu_id, enum x86_init_sipi type,
 			int sipi_vector)
 {
-	struct per_cpu *target_data = per_cpu(cpu_id);
+	struct public_per_cpu *target_data = public_per_cpu(cpu_id);
 	bool send_nmi = false;
 
 	spin_lock(&target_data->control_lock);
 
 	if (type == X86_INIT) {
-		if (!target_data->wait_for_sipi) {
+		if (!target_data->wait_for_sipi &&
+		    !target_data->init_signaled) {
 			target_data->init_signaled = true;
 			send_nmi = true;
 		}
@@ -219,69 +154,77 @@ void x86_send_init_sipi(unsigned int cpu_id, enum x86_init_sipi type,
 
 	if (send_nmi)
 		apic_send_nmi_ipi(target_data);
+
+	/*
+	 * On real hardware, the Delivery Status flag signals that the
+	 * INIT request has not yet arrived. But we can't easily associate that
+	 * flag on the sender side with the target state. Therefore, emulate
+	 * this feedback channel by delaying the requester during submission.
+	 */
+	if (type == X86_INIT) {
+		while (target_data->init_signaled) {
+			x86_check_events();
+			cpu_relax();
+		}
+	}
 }
 
 /* control_lock has to be held */
-static void x86_enter_wait_for_sipi(struct per_cpu *cpu_data)
+static void x86_enter_wait_for_sipi(struct public_per_cpu *cpu_public)
 {
-	cpu_data->init_signaled = false;
-	cpu_data->wait_for_sipi = true;
+	cpu_public->init_signaled = false;
+	cpu_public->wait_for_sipi = true;
+}
+
+void __attribute__((weak)) cat_update(void)
+{
 }
 
 void x86_check_events(void)
 {
-	struct per_cpu *cpu_data = this_cpu_data();
+	struct public_per_cpu *cpu_public = this_cpu_public();
 	int sipi_vector = -1;
 
-	spin_lock(&cpu_data->control_lock);
+	spin_lock(&cpu_public->control_lock);
 
-	do {
-		if (cpu_data->init_signaled && !cpu_data->suspend_cpu) {
-			x86_enter_wait_for_sipi(cpu_data);
-			break;
-		}
+	while (cpu_public->suspend_cpu) {
+		cpu_public->cpu_suspended = true;
 
-		cpu_data->cpu_suspended = true;
+		spin_unlock(&cpu_public->control_lock);
 
-		spin_unlock(&cpu_data->control_lock);
-
-		while (cpu_data->suspend_cpu)
+		while (cpu_public->suspend_cpu)
 			cpu_relax();
 
-		if (cpu_data->shutdown_cpu) {
-			apic_clear();
-			vcpu_exit(cpu_data);
-			asm volatile("1: hlt; jmp 1b");
+		spin_lock(&cpu_public->control_lock);
+	}
+
+	cpu_public->cpu_suspended = false;
+
+	if (cpu_public->init_signaled) {
+		x86_enter_wait_for_sipi(cpu_public);
+	} else if (cpu_public->sipi_vector >= 0) {
+		if (!cpu_public->failed) {
+			cpu_public->wait_for_sipi = false;
+			sipi_vector = cpu_public->sipi_vector;
 		}
+		cpu_public->sipi_vector = -1;
+	}
 
-		spin_lock(&cpu_data->control_lock);
-
-		cpu_data->cpu_suspended = false;
-
-		if (cpu_data->sipi_vector >= 0) {
-			if (!cpu_data->failed) {
-				cpu_data->wait_for_sipi = false;
-				sipi_vector = cpu_data->sipi_vector;
-			}
-			cpu_data->sipi_vector = -1;
-		}
-	} while (cpu_data->init_signaled);
-
-	if (cpu_data->flush_vcpu_caches) {
-		cpu_data->flush_vcpu_caches = false;
+	if (cpu_public->flush_vcpu_caches) {
+		cpu_public->flush_vcpu_caches = false;
 		vcpu_tlb_flush();
 	}
 
-	if (cpu_data->update_cat) {
-		cpu_data->update_cat = false;
+	if (cpu_public->update_cat) {
+		cpu_public->update_cat = false;
 		cat_update();
 	}
 
-	spin_unlock(&cpu_data->control_lock);
+	spin_unlock(&cpu_public->control_lock);
 
 	/* wait_for_sipi is only modified on this CPU, so checking outside of
 	 * control_lock is fine */
-	if (cpu_data->wait_for_sipi) {
+	if (cpu_public->wait_for_sipi) {
 		vcpu_park();
 	} else if (sipi_vector >= 0) {
 		printk("CPU %d received SIPI, vector %x\n", this_cpu_id(),
@@ -296,15 +239,15 @@ void x86_check_events(void)
 void __attribute__((noreturn))
 x86_exception_handler(struct exception_frame *frame)
 {
-	panic_printk("FATAL: Jailhouse triggered exception #%d\n",
+	panic_printk("FATAL: Jailhouse triggered exception #%lld\n",
 		     frame->vector);
 	if (frame->error != -1)
-		panic_printk("Error code: %x\n", frame->error);
-	panic_printk("Physical CPU ID: %d\n", phys_processor_id());
-	panic_printk("RIP: %p RSP: %p FLAGS: %x\n", frame->rip, frame->rsp,
-		     frame->flags);
+		panic_printk("Error code: %llx\n", frame->error);
+	panic_printk("Physical CPU ID: %lu\n", phys_processor_id());
+	panic_printk("RIP: 0x%016llx RSP: 0x%016llx FLAGS: %llx\n", frame->rip,
+		     frame->rsp, frame->flags);
 	if (frame->vector == PF_VECTOR)
-		panic_printk("CR2: %p\n", read_cr2());
+		panic_printk("CR2: 0x%016lx\n", read_cr2());
 
 	panic_stop();
 }
@@ -312,18 +255,18 @@ x86_exception_handler(struct exception_frame *frame)
 void __attribute__((noreturn)) arch_panic_stop(void)
 {
 	/* no lock required here as we won't change to false anymore */
-	this_cpu_data()->cpu_suspended = true;
+	this_cpu_public()->cpu_suspended = true;
 	asm volatile("1: hlt; jmp 1b");
 	__builtin_unreachable();
 }
 
 void arch_panic_park(void)
 {
-	struct per_cpu *cpu_data = this_cpu_data();
+	struct public_per_cpu *cpu_public = this_cpu_public();
 
-	spin_lock(&cpu_data->control_lock);
-	x86_enter_wait_for_sipi(cpu_data);
-	spin_unlock(&cpu_data->control_lock);
+	spin_lock(&cpu_public->control_lock);
+	x86_enter_wait_for_sipi(cpu_public);
+	spin_unlock(&cpu_public->control_lock);
 
 	vcpu_park();
 }

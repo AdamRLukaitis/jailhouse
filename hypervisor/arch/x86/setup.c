@@ -14,13 +14,9 @@
 
 #include <jailhouse/entry.h>
 #include <jailhouse/paging.h>
-#include <jailhouse/pci.h>
+#include <jailhouse/printk.h>
 #include <jailhouse/processor.h>
 #include <asm/apic.h>
-#include <asm/bitops.h>
-#include <asm/cat.h>
-#include <asm/ioapic.h>
-#include <asm/iommu.h>
 #include <asm/vcpu.h>
 
 #define IDT_PRESENT_INT		0x00008e00
@@ -29,7 +25,7 @@
 #define NUM_EXCP_DESC		20
 #define IRQ_DESC_START		32
 
-static u64 gdt[] = {
+static u64 gdt[NUM_GDT_DESC] = {
 	[GDT_DESC_NULL]   = 0,
 	[GDT_DESC_CODE]   = 0x00af9b000000ffffUL,
 	[GDT_DESC_TSS]    = 0x0000890000000000UL,
@@ -75,7 +71,7 @@ int arch_init_early(void)
 	for (vector = IRQ_DESC_START; vector < NUM_IDT_DESC; vector++)
 		set_idt_int_gate(vector, (unsigned long)irq_entry);
 
-	return vcpu_vendor_init();
+	return vcpu_early_init();
 }
 
 /*
@@ -129,6 +125,9 @@ int arch_cpu_init(struct per_cpu *cpu_data)
 	asm volatile("str %0" : "=m" (cpu_data->linux_tss.selector));
 	read_descriptor(cpu_data, &cpu_data->linux_tss);
 
+	if (cpu_data->linux_tss.selector / 8 >= NUM_GDT_DESC)
+		return trace_error(-EINVAL);
+
 	/* save CS as long as we have access to the Linux page table */
 	asm volatile("mov %%cs,%0" : "=m" (cpu_data->linux_cs.selector));
 	read_descriptor(cpu_data, &cpu_data->linux_cs);
@@ -147,10 +146,6 @@ int arch_cpu_init(struct per_cpu *cpu_data)
 	asm volatile("mov %%gs,%0" : "=m" (cpu_data->linux_gs.selector));
 	read_descriptor(cpu_data, &cpu_data->linux_gs);
 	cpu_data->linux_gs.base = read_msr(MSR_GS_BASE);
-
-	/* set up per-CPU helpers */
-	write_msr(MSR_GS_BASE, (unsigned long)cpu_data);
-	cpu_data->cpu_data = cpu_data;
 
 	/* read registers to restore on first VM-entry */
 	for (n = 0; n < NUM_ENTRY_REGS; n++)
@@ -188,10 +183,10 @@ int arch_cpu_init(struct per_cpu *cpu_data)
 
 	/* swap CR3 */
 	cpu_data->linux_cr3 = read_cr3();
-	write_cr3(paging_hvirt2phys(hv_paging_structs.root_table));
+	write_cr3(paging_hvirt2phys(cpu_data->pg_structs.root_table));
 
 	cpu_data->pat = read_msr(MSR_IA32_PAT);
-	write_msr(MSR_IA32_PAT, PAT_RESET_VALUE);
+	write_msr(MSR_IA32_PAT, PAT_HOST_VALUE);
 
 	cpu_data->mtrr_def_type = read_msr(MSR_IA32_MTRR_DEF_TYPE);
 
@@ -201,50 +196,35 @@ int arch_cpu_init(struct per_cpu *cpu_data)
 
 	err = apic_cpu_init(cpu_data);
 	if (err)
-		goto error_out;
+		return err;
 
-	err = vcpu_init(cpu_data);
-	if (err)
-		goto error_out;
-
-	return 0;
-
-error_out:
-	arch_cpu_restore(cpu_data, err);
-	return err;
+	return vcpu_init(cpu_data);
 }
 
-int arch_init_late(void)
+void __attribute__((noreturn)) arch_cpu_activate_vmm(void)
 {
-	int err;
+	unsigned int cpu_id = this_cpu_id();
 
-	err = iommu_init();
-	if (err)
-		return err;
+	/*
+	 * Switch the stack to the private mapping before deactivating the
+	 * common one.
+	 */
+	asm volatile(
+		"add %0,%%rsp"
+		: : "g" (LOCAL_CPU_BASE - (unsigned long)per_cpu(cpu_id)));
 
-	err = map_root_memory_regions();
-	if (err)
-		return err;
+	/* Revoke full per_cpu access now that everything is set up. */
+	paging_map_all_per_cpu(cpu_id, false);
 
-	err = pci_init();
-	if (err)
-		return err;
-
-	err = ioapic_init();
-	if (err)
-		return err;
-
-	return cat_init();
+	vcpu_activate_vmm();
 }
 
-void __attribute__((noreturn)) arch_cpu_activate_vmm(struct per_cpu *cpu_data)
+void arch_cpu_restore(unsigned int cpu_id, int return_code)
 {
-	vcpu_activate_vmm(cpu_data);
-}
-
-void arch_cpu_restore(struct per_cpu *cpu_data, int return_code)
-{
-	u64 *gdt;
+	static spinlock_t tss_lock;
+	struct per_cpu *cpu_data = per_cpu(cpu_id);
+	unsigned int tss_idx;
+	u64 *linux_gdt;
 
 	if (!cpu_data->initialized)
 		return;
@@ -254,8 +234,26 @@ void arch_cpu_restore(struct per_cpu *cpu_data, int return_code)
 	write_msr(MSR_IA32_PAT, cpu_data->pat);
 	write_msr(MSR_EFER, cpu_data->linux_efer);
 	write_cr0(cpu_data->linux_cr0);
-	write_cr3(cpu_data->linux_cr3);
 	write_cr4(cpu_data->linux_cr4);
+	/* cr3 must be last in case cr4 enables PCID */
+	write_cr3(cpu_data->linux_cr3);
+
+	/*
+	 * Copy Linux TSS descriptor into our GDT, clearing the busy flag,
+	 * then reload TR from it. We can't use Linux' GDT as it is r/o.
+	 * Access can happen concurrently on multiple CPUs, so we have to
+	 * serialize the critical section.
+	 */
+	linux_gdt = (u64 *)cpu_data->linux_gdtr.base;
+	tss_idx = cpu_data->linux_tss.selector / 8;
+
+	spin_lock(&tss_lock);
+
+	gdt[tss_idx] = linux_gdt[tss_idx] & ~DESC_TSS_BUSY;
+	gdt[tss_idx + 1] = linux_gdt[tss_idx + 1];
+	asm volatile("ltr %%ax" : : "a" (cpu_data->linux_tss.selector));
+
+	spin_unlock(&tss_lock);
 
 	asm volatile("lgdtq %0" : : "m" (cpu_data->linux_gdtr));
 	asm volatile("lidtq %0" : : "m" (cpu_data->linux_idtr));
@@ -271,11 +269,6 @@ void arch_cpu_restore(struct per_cpu *cpu_data, int return_code)
 		"mfence\n\t"
 		"swapgs\n\t"
 		: : "r" (cpu_data->linux_gs.selector));
-
-	/* clear busy flag in Linux TSS, then reload it */
-	gdt = (u64 *)cpu_data->linux_gdtr.base;
-	gdt[cpu_data->linux_tss.selector / 8] &= ~DESC_TSS_BUSY;
-	asm volatile("ltr %%ax" : : "a" (cpu_data->linux_tss.selector));
 
 	write_msr(MSR_FS_BASE, cpu_data->linux_fs.base);
 	write_msr(MSR_GS_BASE, cpu_data->linux_gs.base);

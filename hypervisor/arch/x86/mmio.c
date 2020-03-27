@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2013
+ * Copyright (c) Siemens AG, 2013-2018
  * Copyright (c) Valentine Sinitsyn, 2014
  *
  * Authors:
@@ -15,11 +15,16 @@
 #include <jailhouse/mmio.h>
 #include <jailhouse/paging.h>
 #include <jailhouse/printk.h>
-#include <asm/ioapic.h>
-#include <asm/iommu.h>
 #include <asm/vcpu.h>
 
 #define X86_MAX_INST_LEN	15
+
+/*
+ * There are a few instructions that can have 8-byte immediate values
+ * on 64-bit mode, but they are not supported/expected here, so we are
+ * safe.
+ */
+#define IMMEDIATE_SIZE          4
 
 union opcode {
 	u8 raw;
@@ -41,21 +46,26 @@ union opcode {
 
 struct parse_context {
 	unsigned int remaining;
+	unsigned int count;
 	unsigned int size;
 	const u8 *inst;
+	bool has_immediate;
+	bool does_write;
+	bool has_rex_w;
+	bool has_rex_r;
+	bool has_addrsz_prefix;
+	bool has_opsz_prefix;
+	bool zero_extend;
 };
 
-static void ctx_move_next_byte(struct parse_context *ctx)
+static bool ctx_update(struct parse_context *ctx, u64 *pc, unsigned int advance,
+		       const struct guest_paging_structures *pg)
 {
-	ctx->inst++;
-	ctx->size--;
-}
-
-static bool ctx_maybe_get_bytes(struct parse_context *ctx,
-				unsigned long *pc,
-				const struct guest_paging_structures *pg)
-{
-	if (!ctx->size) {
+	ctx->inst += advance;
+	ctx->count += advance;
+	if (ctx->size > advance) {
+		ctx->size -= advance;
+	} else {
 		ctx->size = ctx->remaining;
 		ctx->inst = vcpu_get_inst_bytes(pg, *pc, &ctx->size);
 		if (!ctx->inst)
@@ -66,96 +76,217 @@ static bool ctx_maybe_get_bytes(struct parse_context *ctx,
 	return true;
 }
 
-static bool ctx_advance(struct parse_context *ctx,
-			unsigned long *pc,
-			const struct guest_paging_structures *pg)
+static void parse_widths(struct parse_context *ctx,
+		         struct mmio_instruction *inst, bool parse_addr_width)
 {
-	ctx_move_next_byte(ctx);
-	return ctx_maybe_get_bytes(ctx, pc, pg);
+	u16 cs_attr = vcpu_vendor_get_cs_attr();
+	bool cs_db = !!(cs_attr & VCPU_CS_DB);
+	bool long_mode =
+		(vcpu_vendor_get_efer() & EFER_LMA) && (cs_attr & VCPU_CS_L);
+
+	/* Op size prefix is ignored if rex.w = 1 */
+	if (ctx->has_rex_w) {
+		inst->access_size = 8;
+	} else {
+		/* CS.d is ignored in long mode */
+		if (long_mode)
+			inst->access_size = ctx->has_opsz_prefix ? 2 : 4;
+		else
+			inst->access_size =
+				(cs_db ^ ctx->has_opsz_prefix) ? 4 : 2;
+	}
+
+	if (parse_addr_width) {
+		if (long_mode)
+			inst->inst_len += ctx->has_addrsz_prefix ? 4 : 8;
+		else
+			inst->inst_len +=
+				(cs_db ^ ctx->has_addrsz_prefix) ? 4 : 2;
+	}
 }
 
-struct mmio_instruction x86_mmio_parse(unsigned long pc,
-	const struct guest_paging_structures *pg_structs, bool is_write)
+struct mmio_instruction
+x86_mmio_parse(const struct guest_paging_structures *pg_structs, bool is_write)
 {
-	struct parse_context ctx = { .remaining = X86_MAX_INST_LEN };
-	struct mmio_instruction inst = { .inst_len = 0 };
-	union opcode op[3] = { };
-	bool has_rex_r = false;
-	bool does_write;
+	struct parse_context ctx = { .remaining = X86_MAX_INST_LEN,
+				     .count = 1 };
+	union registers *guest_regs = &this_cpu_data()->guest_regs;
+	struct mmio_instruction inst = { 0 };
+	u64 pc = vcpu_vendor_get_rip();
+	unsigned int n, skip_len = 0;
+	union opcode op[4] = { };
 
-restart:
-	if (!ctx_maybe_get_bytes(&ctx, &pc, pg_structs))
+	if (!ctx_update(&ctx, &pc, 0, pg_structs))
 		goto error_noinst;
 
-	op[0].raw = *(ctx.inst);
+restart:
+	op[0].raw = *ctx.inst;
 	if (op[0].rex.code == X86_REX_CODE) {
-		/* REX.W is simply over-read since it is only affects the
-		 * memory address in our supported modes which we get from the
-		 * virtualization support. */
+		if (op[0].rex.w)
+			ctx.has_rex_w = true;
 		if (op[0].rex.r)
-			has_rex_r = true;
+			ctx.has_rex_r = true;
 		if (op[0].rex.x)
 			goto error_unsupported;
 
-		ctx_move_next_byte(&ctx);
-		inst.inst_len++;
+		if (!ctx_update(&ctx, &pc, 1, pg_structs))
+			goto error_noinst;
 		goto restart;
 	}
 	switch (op[0].raw) {
+	case X86_PREFIX_ADDR_SZ:
+		if (!ctx_update(&ctx, &pc, 1, pg_structs))
+			goto error_noinst;
+		ctx.has_addrsz_prefix = true;
+		goto restart;
+	case X86_PREFIX_OP_SZ:
+		if (!ctx_update(&ctx, &pc, 1, pg_structs))
+			goto error_noinst;
+		ctx.has_opsz_prefix = true;
+		goto restart;
+	case X86_OP_MOVZX_OPC1:
+		ctx.zero_extend = true;
+		if (!ctx_update(&ctx, &pc, 1, pg_structs))
+			goto error_noinst;
+		op[1].raw = *ctx.inst;
+		if (op[1].raw == X86_OP_MOVZX_OPC2_B)
+			inst.access_size = 1;
+		else if (op[1].raw == X86_OP_MOVZX_OPC2_W)
+			inst.access_size = 2;
+		else
+			goto error_unsupported;
+		break;
+	case X86_OP_MOVB_TO_MEM:
+		inst.access_size = 1;
+		ctx.does_write = true;
+		break;
 	case X86_OP_MOV_TO_MEM:
-		inst.inst_len += 2;
-		inst.access_size = 4;
-		does_write = true;
+		parse_widths(&ctx, &inst, false);
+		ctx.does_write = true;
+		break;
+	case X86_OP_MOVB_FROM_MEM:
+		inst.access_size = 1;
 		break;
 	case X86_OP_MOV_FROM_MEM:
-		inst.inst_len += 2;
-		inst.access_size = 4;
-		does_write = false;
+		parse_widths(&ctx, &inst, false);
 		break;
+	case X86_OP_MOV_IMMEDIATE_TO_MEM:
+		parse_widths(&ctx, &inst, false);
+		ctx.has_immediate = true;
+		ctx.does_write = true;
+		break;
+	case X86_OP_MOV_MEM_TO_AX:
+		parse_widths(&ctx, &inst, true);
+		inst.in_reg_num = 15;
+		goto final;
+	case X86_OP_MOV_AX_TO_MEM:
+		parse_widths(&ctx, &inst, true);
+		inst.out_val = guest_regs->by_index[15];
+		ctx.does_write = true;
+		goto final;
 	default:
 		goto error_unsupported;
 	}
 
-	if (!ctx_advance(&ctx, &pc, pg_structs))
+	if (!ctx_update(&ctx, &pc, 1, pg_structs))
 		goto error_noinst;
 
-	op[1].raw = *(ctx.inst);
-	switch (op[1].modrm.mod) {
-	case 0:
-		if (op[1].modrm.rm == 5) { /* 32-bit displacement */
-			inst.inst_len += 4;
-			break;
-		} else if (op[1].modrm.rm != 4) { /* no SIB */
-			break;
+	op[2].raw = *ctx.inst;
+
+	/*
+	 * reg_preserve_mask defaults to 0, and only needs to be set in case of
+	 * reads
+	 */
+	if (!ctx.does_write) {
+		/*
+		 * MOVs on 32 or 64 bit destination registers need no
+		 * adjustment of the reg_preserve_mask, all upper bits will
+		 * always be cleared.
+		 *
+		 * In case of 16 or 8 bit registers, the instruction must only
+		 * modify bits within that width. Therefore, reg_preserve_mask
+		 * may be set to preserve upper bits.
+		 *
+		 * For regular instructions, this is the case if access_size < 4.
+		 *
+		 * For zero-extend instructions, this is the case if the
+		 * operand size override prefix is set.
+		 */
+		if (!ctx.zero_extend && inst.access_size < 4) {
+			/*
+			 * Restrict access to the width of the access_size, and
+			 * preserve all other bits
+			 */
+			inst.reg_preserve_mask = ~BYTE_MASK(inst.access_size);
+		} else if (ctx.zero_extend && ctx.has_opsz_prefix) {
+			/*
+			 * Always preserve bits 16-63. Potential zero-extend of
+			 * bits 8-15 is ensured by access_size
+			 */
+			inst.reg_preserve_mask = ~BYTE_MASK(2);
 		}
+	}
 
-		inst.inst_len++;
+	/* ensure that we are actually talking about mov imm,<mem> */
+	if (op[0].raw == X86_OP_MOV_IMMEDIATE_TO_MEM && op[2].modrm.reg != 0)
+		goto error_unsupported;
 
-		if (!ctx_advance(&ctx, &pc, pg_structs))
-			goto error_noinst;
+	switch (op[2].modrm.mod) {
+	case 0:
+		if (op[2].modrm.rm == 4) { /* SIB */
+			if (!ctx_update(&ctx, &pc, 1, pg_structs))
+				goto error_noinst;
 
-		op[2].raw = *(ctx.inst);
-		if (op[2].sib.base == 5)
-			inst.inst_len += 4;
+			op[3].raw = *ctx.inst;
+			if (op[3].sib.base == 5)
+				skip_len = 4;
+		} else if (op[2].modrm.rm == 5) { /* 32-bit displacement */
+			skip_len = 4;
+		}
 		break;
 	case 1:
 	case 2:
-		if (op[1].modrm.rm == 4) /* SIB */
-			goto error_unsupported;
-		inst.inst_len += op[1].modrm.mod == 1 ? 1 : 4;
+		skip_len = op[2].modrm.mod == 1 ? 1 : 4;
+		if (op[2].modrm.rm == 4) /* SIB */
+			skip_len++;
 		break;
 	default:
 		goto error_unsupported;
 	}
-	if (has_rex_r)
-		inst.reg_num = 7 - op[1].modrm.reg;
-	else if (op[1].modrm.reg == 4)
+
+	if (ctx.has_rex_r)
+		inst.in_reg_num = 7 - op[2].modrm.reg;
+	else if (op[2].modrm.reg == 4)
 		goto error_unsupported;
 	else
-		inst.reg_num = 15 - op[1].modrm.reg;
+		inst.in_reg_num = 15 - op[2].modrm.reg;
 
-	if (does_write != is_write)
+	if (ctx.has_immediate) {
+		/* walk any not yet retrieved SIB or displacement bytes */
+		if (!ctx_update(&ctx, &pc, skip_len, pg_structs))
+			goto error_noinst;
+
+		/* retrieve immediate value */
+		for (n = 0; n < IMMEDIATE_SIZE; n++) {
+			if (!ctx_update(&ctx, &pc, 1, pg_structs))
+				goto error_noinst;
+			inst.out_val |= (unsigned long)*ctx.inst << (n * 8);
+		}
+
+		/* sign-extend immediate if the target is 64-bit */
+		if (ctx.has_rex_w)
+			inst.out_val = (s64)(s32)inst.out_val;
+	} else {
+		inst.inst_len += skip_len;
+		if (ctx.does_write)
+			inst.out_val = guest_regs->by_index[inst.in_reg_num];
+	}
+
+final:
+	if (ctx.does_write != is_write)
 		goto error_inconsitent;
+
+	inst.inst_len += ctx.count;
 
 	return inst;
 
@@ -164,8 +295,9 @@ error_noinst:
 	goto error;
 
 error_unsupported:
-	panic_printk("FATAL: unsupported instruction (0x%02x 0x%02x 0x%02x)\n",
-		     op[0].raw, op[1].raw, op[2].raw);
+	panic_printk("FATAL: unsupported instruction "
+		     "(0x%02x 0x%02x 0x%02x 0x%02x)\n",
+		     op[0].raw, op[1].raw, op[2].raw, op[3].raw);
 	goto error;
 
 error_inconsitent:
@@ -174,10 +306,4 @@ error_inconsitent:
 error:
 	inst.inst_len = 0;
 	return inst;
-}
-
-unsigned int arch_mmio_count_regions(struct cell *cell)
-{
-	return pci_mmio_count_regions(cell) + ioapic_mmio_count_regions(cell) +
-		iommu_mmio_count_regions(cell);
 }

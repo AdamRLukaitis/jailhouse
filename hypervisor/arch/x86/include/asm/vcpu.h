@@ -17,25 +17,13 @@
 #include <jailhouse/cell-config.h>
 #include <jailhouse/entry.h>
 #include <jailhouse/paging.h>
-#include <asm/percpu.h>
+#include <jailhouse/percpu.h>
 #include <asm/processor.h>
 
 #define X86_CR0_HOST_STATE \
 	(X86_CR0_PG | X86_CR0_WP | X86_CR0_NE | X86_CR0_ET | X86_CR0_TS | \
 	 X86_CR0_MP | X86_CR0_PE)
 #define X86_CR4_HOST_STATE	X86_CR4_PAE
-
-struct vcpu_io_bitmap {
-	u8 *data;
-	u32 size;
-};
-
-struct vcpu_execution_state {
-	u64 efer;
-	u64 rflags;
-	u16 cs;
-	u64 rip;
-};
 
 struct vcpu_io_intercept {
 	u16 port;
@@ -50,7 +38,9 @@ struct vcpu_mmio_intercept {
 	bool is_write;
 };
 
-int vcpu_vendor_init(void);
+int vcpu_early_init(void);
+
+int vcpu_vendor_early_init(void);
 
 int vcpu_cell_init(struct cell *cell);
 int vcpu_vendor_cell_init(struct cell *cell);
@@ -65,7 +55,7 @@ void vcpu_vendor_cell_exit(struct cell *cell);
 int vcpu_init(struct per_cpu *cpu_data);
 void vcpu_exit(struct per_cpu *cpu_data);
 
-void __attribute__((noreturn)) vcpu_activate_vmm(struct per_cpu *cpu_data);
+void __attribute__((noreturn)) vcpu_activate_vmm(void);
 void __attribute__((noreturn)) vcpu_deactivate_vmm(void);
 
 void vcpu_handle_exit(struct per_cpu *cpu_data);
@@ -93,14 +83,24 @@ const u8 *vcpu_get_inst_bytes(const struct guest_paging_structures *pg_structs,
 
 void vcpu_skip_emulated_instruction(unsigned int inst_len);
 
-void vcpu_vendor_get_cell_io_bitmap(struct cell *cell,
-		                    struct vcpu_io_bitmap *out);
+unsigned int vcpu_vendor_get_io_bitmap_pages(void);
 
-void vcpu_vendor_get_execution_state(struct vcpu_execution_state *x_state);
+#define VCPU_CS_DPL_MASK	BIT_MASK(6, 5)
+#define VCPU_CS_L		(1 << 13)
+#define VCPU_CS_DB		(1 << 14)
+
+u64 vcpu_vendor_get_efer(void);
+u64 vcpu_vendor_get_rflags(void);
+u64 vcpu_vendor_get_rip(void);
+u16 vcpu_vendor_get_cs_attr(void);
+
 void vcpu_vendor_get_io_intercept(struct vcpu_io_intercept *io);
 void vcpu_vendor_get_mmio_intercept(struct vcpu_mmio_intercept *mmio);
 
-bool vcpu_get_guest_paging_structs(struct guest_paging_structures *pg_structs);
+unsigned long vcpu_vendor_get_guest_cr4(void);
+
+void vcpu_get_guest_paging_structs(struct guest_paging_structures *pg_structs);
+pt_entry_t vcpu_pae_get_pdpte(page_table_t page_table, unsigned long virt);
 
 void vcpu_vendor_set_guest_pat(unsigned long val);
 
@@ -113,8 +113,6 @@ bool vcpu_handle_msr_read(void);
 bool vcpu_handle_msr_write(void);
 
 void vcpu_handle_cpuid(void);
-
-bool vcpu_handle_xsetbv(void);
 
 void vcpu_reset(unsigned int sipi_vector);
 void vcpu_vendor_reset(unsigned int sipi_vector);

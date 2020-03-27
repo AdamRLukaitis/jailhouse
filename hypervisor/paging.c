@@ -14,7 +14,6 @@
 #include <jailhouse/printk.h>
 #include <jailhouse/string.h>
 #include <jailhouse/control.h>
-#include <asm/bitops.h>
 
 #define BITS_PER_PAGE		(PAGE_SIZE * 8)
 
@@ -27,6 +26,8 @@ extern u8 __page_pool[];
 /**
  * Offset between virtual and physical hypervisor addresses.
  *
+ * Jailhouse operates in a physically contiguous memory region,
+ * enabling offset-based address conversion.
  * @note Private, use page_map_hvirt2phys() or page_map_phys2hvirt() instead.
  */
 unsigned long page_offset;
@@ -41,6 +42,9 @@ struct page_pool remap_pool = {
 
 /** Descriptor of the hypervisor paging structures. */
 struct paging_structures hv_paging_structs;
+
+/** Descriptor of paging structures used when parking CPUs. */
+struct paging_structures parking_pt;
 
 /**
  * Trivial implementation of paging::get_phys (for non-terminal levels)
@@ -89,6 +93,58 @@ static unsigned long find_next_free_page(struct page_pool *pool,
 
 /**
  * Allocate consecutive pages from the specified pool.
+ * @param pool		Page pool to allocate from.
+ * @param num		Number of pages.
+ * @param align_mask	Choose start so that start_page_no & align_mask == 0.
+ *
+ * @return Pointer to first page or NULL if allocation failed.
+ *
+ * @see page_free
+ */
+static void *page_alloc_internal(struct page_pool *pool, unsigned int num,
+				 unsigned long align_mask)
+{
+	unsigned long aligned_start, pool_start, next, start, last;
+	unsigned int allocated;
+
+	pool_start = (unsigned long)pool->base_address >> PAGE_SHIFT;
+
+	/* The pool itself might not be aligned as required. */
+	aligned_start = ((pool_start + align_mask) & ~align_mask) - pool_start;
+	next = aligned_start;
+
+restart:
+	/* Forward the search start to the next aligned page. */
+	if ((next - aligned_start) & align_mask)
+		next += num - ((next - aligned_start) & align_mask);
+
+	start = next = find_next_free_page(pool, next);
+	if (start == INVALID_PAGE_NR || num == 0)
+		return NULL;
+
+	/* Enforce alignment (none of align_mask is 0). */
+	if ((start - aligned_start) & align_mask)
+		goto restart;
+
+	for (allocated = 1, last = start; allocated < num;
+	     allocated++, last = next) {
+		next = find_next_free_page(pool, last + 1);
+		if (next == INVALID_PAGE_NR)
+			return NULL;
+		if (next != last + 1)
+			goto restart;	/* not consecutive */
+	}
+
+	for (allocated = 0; allocated < num; allocated++)
+		set_bit(start + allocated, pool->used_bitmap);
+
+	pool->used_pages += num;
+
+	return pool->base_address + start * PAGE_SIZE;
+}
+
+/**
+ * Allocate consecutive pages from the specified pool.
  * @param pool	Page pool to allocate from.
  * @param num	Number of pages.
  *
@@ -98,31 +154,21 @@ static unsigned long find_next_free_page(struct page_pool *pool,
  */
 void *page_alloc(struct page_pool *pool, unsigned int num)
 {
-	unsigned long start, last, next;
-	unsigned int allocated;
+	return page_alloc_internal(pool, num, 0);
+}
 
-	start = find_next_free_page(pool, 0);
-	if (start == INVALID_PAGE_NR || num == 0)
-		return NULL;
-
-restart:
-	for (allocated = 1, last = start; allocated < num;
-	     allocated++, last = next) {
-		next = find_next_free_page(pool, last + 1);
-		if (next == INVALID_PAGE_NR)
-			return NULL;
-		if (next != last + 1) {
-			start = next;
-			goto restart;
-		}
-	}
-
-	for (allocated = 0; allocated < num; allocated++)
-		set_bit(start + allocated, pool->used_bitmap);
-
-	pool->used_pages += num;
-
-	return pool->base_address + start * PAGE_SIZE;
+/**
+ * Allocate aligned consecutive pages from the specified pool.
+ * @param pool	Page pool to allocate from.
+ * @param num	Number of pages. Num needs to be a power of 2.
+ *
+ * @return Pointer to first page or NULL if allocation failed.
+ *
+ * @see page_free
+ */
+void *page_alloc_aligned(struct page_pool *pool, unsigned int num)
+{
+	return page_alloc_internal(pool, num, num - 1);
 }
 
 /**
@@ -155,7 +201,7 @@ void page_free(struct page_pool *pool, void *page, unsigned int num)
  * @param pg_structs	Paging structures to use for translation.
  * @param virt		Virtual address.
  * @param flags		Access flags that have to be supported by the mapping,
- * 			see @ref PAGE_FLAGS.
+ * 			see @ref PAGE_ACCESS_FLAGS.
  *
  * @return Physical address on success or @c INVALID_PHYS_ADDR if the virtual
  * 	   address could not be translated or the requested access is not
@@ -185,14 +231,15 @@ unsigned long paging_virt2phys(const struct paging_structures *pg_structs,
 	}
 }
 
-static void flush_pt_entry(pt_entry_t pte, enum paging_coherent coherent)
+static void flush_pt_entry(pt_entry_t pte, unsigned long paging_flags)
 {
-	if (coherent == PAGING_COHERENT)
+	if (paging_flags & PAGING_COHERENT)
 		arch_paging_flush_cpu_caches(pte, sizeof(*pte));
 }
 
-static int split_hugepage(const struct paging *paging, pt_entry_t pte,
-			  unsigned long virt, enum paging_coherent coherent)
+static int split_hugepage(bool hv_paging, const struct paging *paging,
+			  pt_entry_t pte, unsigned long virt,
+			  unsigned long paging_flags)
 {
 	unsigned long phys = paging->get_phys(pte, virt);
 	struct paging_structures sub_structs;
@@ -201,21 +248,22 @@ static int split_hugepage(const struct paging *paging, pt_entry_t pte,
 	if (phys == INVALID_PHYS_ADDR)
 		return 0;
 
-	page_mask = ~(paging->page_size - 1);
+	page_mask = ~((unsigned long)paging->page_size - 1);
 	phys &= page_mask;
 	virt &= page_mask;
 
 	flags = paging->get_flags(pte);
 
+	sub_structs.hv_paging = hv_paging;
 	sub_structs.root_paging = paging + 1;
 	sub_structs.root_table = page_alloc(&mem_pool, 1);
 	if (!sub_structs.root_table)
 		return -ENOMEM;
 	paging->set_next_pt(pte, paging_hvirt2phys(sub_structs.root_table));
-	flush_pt_entry(pte, coherent);
+	flush_pt_entry(pte, paging_flags);
 
 	return paging_create(&sub_structs, phys, paging->page_size, virt,
-			     flags, coherent);
+			     flags, paging_flags);
 }
 
 /**
@@ -224,9 +272,9 @@ static int split_hugepage(const struct paging *paging, pt_entry_t pte,
  * @param phys		Physical address of the region to be mapped.
  * @param size		Size of the region.
  * @param virt		Virtual address the region should be mapped to.
- * @param flags		Flags describing the permitted access, see
- * 			@ref PAGE_FLAGS.
- * @param coherent	Coherency of mapping.
+ * @param access_flags	Flags describing the permitted page access, see
+ * 			@ref PAGE_ACCESS_FLAGS.
+ * @param paging_flags	Flags describing the paging mode, see @ref PAGING_FLAGS.
  *
  * @return 0 on success, negative error code otherwise.
  *
@@ -238,7 +286,7 @@ static int split_hugepage(const struct paging *paging, pt_entry_t pte,
  */
 int paging_create(const struct paging_structures *pg_structs,
 		  unsigned long phys, unsigned long size, unsigned long virt,
-		  unsigned long flags, enum paging_coherent coherent)
+		  unsigned long access_flags, unsigned long paging_flags)
 {
 	phys &= PAGE_MASK;
 	virt &= PAGE_MASK;
@@ -247,6 +295,7 @@ int paging_create(const struct paging_structures *pg_structs,
 	while (size > 0) {
 		const struct paging *paging = pg_structs->root_paging;
 		page_table_t pt = pg_structs->root_table;
+		struct paging_structures sub_structs;
 		pt_entry_t pte;
 		int err;
 
@@ -254,24 +303,32 @@ int paging_create(const struct paging_structures *pg_structs,
 			pte = paging->get_entry(pt, virt);
 			if (paging->page_size > 0 &&
 			    paging->page_size <= size &&
-			    ((phys | virt) & (paging->page_size - 1)) == 0) {
+			    ((phys | virt) & (paging->page_size - 1)) == 0 &&
+			    (paging_flags & PAGING_HUGE ||
+			     paging->page_size == PAGE_SIZE)) {
 				/*
 				 * We might be overwriting a more fine-grained
 				 * mapping, so release it first. This cannot
 				 * fail as we are working along hugepage
 				 * boundaries.
 				 */
-				if (paging->page_size > PAGE_SIZE)
-					paging_destroy(pg_structs, virt,
+				if (paging->page_size > PAGE_SIZE) {
+					sub_structs.root_paging = paging;
+					sub_structs.root_table = pt;
+					sub_structs.hv_paging =
+						pg_structs->hv_paging;
+					paging_destroy(&sub_structs, virt,
 						       paging->page_size,
-						       coherent);
-				paging->set_terminal(pte, phys, flags);
-				flush_pt_entry(pte, coherent);
+						       paging_flags);
+				}
+				paging->set_terminal(pte, phys, access_flags);
+				flush_pt_entry(pte, paging_flags);
 				break;
 			}
 			if (paging->entry_valid(pte, PAGE_PRESENT_FLAGS)) {
-				err = split_hugepage(paging, pte, virt,
-						     coherent);
+				err = split_hugepage(pg_structs->hv_paging,
+						     paging, pte, virt,
+						     paging_flags);
 				if (err)
 					return err;
 				pt = paging_phys2hvirt(
@@ -282,11 +339,11 @@ int paging_create(const struct paging_structures *pg_structs,
 					return -ENOMEM;
 				paging->set_next_pt(pte,
 						    paging_hvirt2phys(pt));
-				flush_pt_entry(pte, coherent);
+				flush_pt_entry(pte, paging_flags);
 			}
 			paging++;
 		}
-		if (pg_structs == &hv_paging_structs)
+		if (pg_structs->hv_paging)
 			arch_paging_flush_page_tlbs(virt);
 
 		phys += paging->page_size;
@@ -301,7 +358,7 @@ int paging_create(const struct paging_structures *pg_structs,
  * @param pg_structs	Descriptor of paging structures to be used.
  * @param virt		Virtual address the region to be unmapped.
  * @param size		Size of the region.
- * @param coherent	Coherency of mapping.
+ * @param paging_flags	Flags describing the paging mode, see @ref PAGING_FLAGS.
  *
  * @return 0 on success, negative error code otherwise.
  *
@@ -314,7 +371,7 @@ int paging_create(const struct paging_structures *pg_structs,
  */
 int paging_destroy(const struct paging_structures *pg_structs,
 		   unsigned long virt, unsigned long size,
-		   enum paging_coherent coherent)
+		   unsigned long paging_flags)
 {
 	size = PAGE_ALIGN(size);
 
@@ -333,13 +390,26 @@ int paging_destroy(const struct paging_structures *pg_structs,
 			if (!paging->entry_valid(pte, PAGE_PRESENT_FLAGS))
 				break;
 			if (paging->get_phys(pte, virt) != INVALID_PHYS_ADDR) {
-				if (paging->page_size > size) {
-					err = split_hugepage(paging, pte, virt,
-							     coherent);
-					if (err)
-						return err;
-				} else
+				unsigned long page_start;
+
+				/*
+				 * If the region to be unmapped doesn't fully
+				 * cover the hugepage, the hugepage will need to
+				 * be split.
+				 */
+				page_size = paging->page_size ?
+					paging->page_size : PAGE_SIZE;
+				page_start = virt & ~(page_size-1);
+
+				if (virt <= page_start &&
+				    virt + size >= page_start + page_size)
 					break;
+
+				err = split_hugepage(pg_structs->hv_paging,
+						     paging, pte, virt,
+						     paging_flags);
+				if (err)
+					return err;
 			}
 			pt[++n] = paging_phys2hvirt(paging->get_next_pt(pte));
 			paging++;
@@ -350,14 +420,14 @@ int paging_destroy(const struct paging_structures *pg_structs,
 		/* walk up again, clearing entries, releasing empty tables */
 		while (1) {
 			paging->clear_entry(pte);
-			flush_pt_entry(pte, coherent);
+			flush_pt_entry(pte, paging_flags);
 			if (n == 0 || !paging->page_table_empty(pt[n]))
 				break;
 			page_free(&mem_pool, pt[n], 1);
 			paging--;
 			pte = paging->get_entry(pt[--n], virt);
 		}
-		if (pg_structs == &hv_paging_structs)
+		if (pg_structs->hv_paging)
 			arch_paging_flush_page_tlbs(virt);
 
 		if (page_size > size)
@@ -381,14 +451,13 @@ paging_gvirt2gphys(const struct guest_paging_structures *pg_structs,
 
 	while (1) {
 		/* map guest page table */
-		phys = arch_paging_gphys2phys(this_cpu_data(),
-						page_table_gphys,
-						PAGE_READONLY_FLAGS);
+		phys = arch_paging_gphys2phys(page_table_gphys,
+					      PAGE_READONLY_FLAGS);
 		if (phys == INVALID_PHYS_ADDR)
 			return INVALID_PHYS_ADDR;
-		err = paging_create(&hv_paging_structs, phys, PAGE_SIZE,
-				    tmp_page, PAGE_READONLY_FLAGS,
-				    PAGING_NON_COHERENT);
+		err = paging_create(&this_cpu_data()->pg_structs, phys,
+				    PAGE_SIZE, tmp_page, PAGE_READONLY_FLAGS,
+				    PAGING_NON_COHERENT | PAGING_NO_HUGE);
 		if (err)
 			return INVALID_PHYS_ADDR;
 
@@ -405,6 +474,83 @@ paging_gvirt2gphys(const struct guest_paging_structures *pg_structs,
 }
 
 /**
+ * Map physical device resource into hypervisor address space.
+ * @param phys		Physical address of the resource.
+ * @param size		Size of the resource.
+ *
+ * @return Virtual mapping address of the resource or NULL on error.
+ */
+void *paging_map_device(unsigned long phys, unsigned long size)
+{
+	void *virt;
+
+	virt = page_alloc(&remap_pool, PAGES(size));
+	if (!virt)
+		return NULL;
+
+	if (paging_create(&hv_paging_structs, phys, size, (unsigned long)virt,
+			  PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE,
+			  PAGING_NON_COHERENT | PAGING_HUGE) != 0) {
+		page_free(&remap_pool, virt, PAGES(size));
+		return NULL;
+	}
+
+	return virt;
+}
+
+/**
+ * Unmap physical device resource from hypervisor address space.
+ * @param phys		Physical address of the resource.
+ * @param virt		Virtual address of the resource.
+ * @param size		Size of the resource.
+ *
+ * @note Unmap must use the same parameters as provided to / returned by
+ * paging_map_device().
+ */
+void paging_unmap_device(unsigned long phys, void *virt, unsigned long size)
+{
+	/* Cannot fail if paired with paging_map_device. */
+	paging_destroy(&hv_paging_structs, (unsigned long)virt, size,
+		       PAGING_NON_COHERENT);
+	page_free(&remap_pool, virt, PAGES(size));
+}
+
+/**
+ * Create a top-level link to the common hypervisor page table.
+ * @param pg_dest_structs	Descriptor of the target paging structures.
+ * @param virt			Virtual start address of the linked region.
+ *
+ * @return 0 on success, negative error code otherwise.
+ *
+ * @note The link is only created at the lop level of page table. The source
+ * needs to point the page table hierarchy, not a terminal entry.
+ */
+int paging_create_hvpt_link(const struct paging_structures *pg_dest_structs,
+			    unsigned long virt)
+{
+	const struct paging *paging = hv_paging_structs.root_paging;
+	pt_entry_t source_pte, dest_pte;
+
+	source_pte = paging->get_entry(hv_paging_structs.root_table, virt);
+	dest_pte = paging->get_entry(pg_dest_structs->root_table, virt);
+
+	/*
+	 * Source page table must by populated and the to-be-linked
+	 * region must not be a terminal entry.
+	 */
+	if (!paging->entry_valid(source_pte, PAGE_PRESENT_FLAGS) ||
+	    paging->get_phys(source_pte, virt) != INVALID_PHYS_ADDR)
+		return trace_error(-EINVAL);
+
+	paging->set_next_pt(dest_pte, paging->get_next_pt(source_pte));
+
+	/* Mapping is always non-coherent, so no flush_pt_entry needed. */
+	arch_paging_flush_page_tlbs(virt);
+
+	return 0;
+}
+
+/**
  * Map guest (cell) pages into the hypervisor address space.
  * @param pg_structs	Descriptor of the guest paging structures if @c gaddr
  * 			is a guest-virtual address or @c NULL if it is a
@@ -412,7 +558,7 @@ paging_gvirt2gphys(const struct guest_paging_structures *pg_structs,
  * @param gaddr		Guest address of the first page to be mapped.
  * @param num		Number of pages to be mapped.
  * @param flags		Access flags for the hypervisor mapping, see
- * 			@ref PAGE_FLAGS.
+ * 			@ref PAGE_ACCESS_FLAGS.
  *
  * @return Pointer to first mapped page or @c NULL on error.
  *
@@ -427,32 +573,46 @@ void *paging_get_guest_pages(const struct guest_paging_structures *pg_structs,
 			     unsigned long gaddr, unsigned int num,
 			     unsigned long flags)
 {
-	unsigned long page_base = TEMPORARY_MAPPING_BASE +
-		this_cpu_id() * PAGE_SIZE * NUM_TEMPORARY_PAGES;
-	unsigned long phys, gphys, page_virt = page_base;
+	unsigned long phys, gphys, page_virt = TEMPORARY_MAPPING_BASE;
 	int err;
 
 	if (num > NUM_TEMPORARY_PAGES)
 		return NULL;
 	while (num-- > 0) {
-		if (pg_structs)
+		if (pg_structs && pg_structs->root_paging)
 			gphys = paging_gvirt2gphys(pg_structs, gaddr,
 						   page_virt, flags);
 		else
 			gphys = gaddr;
 
-		phys = arch_paging_gphys2phys(this_cpu_data(), gphys, flags);
+		phys = arch_paging_gphys2phys(gphys, flags);
 		if (phys == INVALID_PHYS_ADDR)
 			return NULL;
 		/* map guest page */
-		err = paging_create(&hv_paging_structs, phys, PAGE_SIZE,
-				    page_virt, flags, PAGING_NON_COHERENT);
+		err = paging_create(&this_cpu_data()->pg_structs, phys,
+				    PAGE_SIZE, page_virt, flags,
+				    PAGING_NON_COHERENT | PAGING_NO_HUGE);
 		if (err)
 			return NULL;
 		gaddr += PAGE_SIZE;
 		page_virt += PAGE_SIZE;
 	}
-	return (void *)page_base;
+	return (void *)TEMPORARY_MAPPING_BASE;
+}
+
+int paging_map_all_per_cpu(unsigned int cpu, bool enable)
+{
+	struct per_cpu *cpu_data = per_cpu(cpu);
+
+	/*
+	 * Note that the physical address does not matter for !enable because
+	 * we mark all pages non-present in that case.
+	 */
+	return paging_create(&hv_paging_structs, paging_hvirt2phys(cpu_data),
+			sizeof(struct per_cpu) - sizeof(struct public_per_cpu),
+			(unsigned long)cpu_data,
+			enable ? PAGE_DEFAULT_FLAGS : PAGE_NONPRESENT_FLAGS,
+			PAGING_NON_COHERENT | PAGING_HUGE);
 }
 
 /**
@@ -462,7 +622,8 @@ void *paging_get_guest_pages(const struct guest_paging_structures *pg_structs,
  */
 int paging_init(void)
 {
-	unsigned long n, per_cpu_pages, config_pages, bitmap_pages, vaddr;
+	unsigned long n, per_cpu_pages, config_pages, bitmap_pages;
+	unsigned long vaddr, flags;
 	int err;
 
 	per_cpu_pages = hypervisor_header.max_cpus *
@@ -490,49 +651,58 @@ int paging_init(void)
 	mem_pool.flags = PAGE_SCRUB_ON_FREE;
 
 	remap_pool.used_bitmap = page_alloc(&mem_pool, NUM_REMAP_BITMAP_PAGES);
-	remap_pool.used_pages =
-		hypervisor_header.max_cpus * NUM_TEMPORARY_PAGES;
-	for (n = 0; n < remap_pool.used_pages; n++)
-		set_bit(n, remap_pool.used_bitmap);
+
+	hv_paging_structs.hv_paging = true;
+	hv_paging_structs.root_table =
+		(page_table_t)public_per_cpu(0)->root_table_page;
 
 	arch_paging_init();
 
-	hv_paging_structs.root_paging = hv_paging;
-	hv_paging_structs.root_table = page_alloc(&mem_pool, 1);
-	if (!hv_paging_structs.root_table)
+	parking_pt.root_table = page_alloc_aligned(&mem_pool,
+						   CELL_ROOT_PT_PAGES);
+	if (!parking_pt.root_table)
 		return -ENOMEM;
 
 	/* Replicate hypervisor mapping of Linux */
 	err = paging_create(&hv_paging_structs,
-			     paging_hvirt2phys(&hypervisor_header),
-			     system_config->hypervisor_memory.size,
-			     (unsigned long)&hypervisor_header,
-			     PAGE_DEFAULT_FLAGS, PAGING_NON_COHERENT);
+			    paging_hvirt2phys(&hypervisor_header),
+			    system_config->hypervisor_memory.size,
+			    (unsigned long)&hypervisor_header,
+			    PAGE_DEFAULT_FLAGS,
+			    PAGING_NON_COHERENT | PAGING_HUGE);
 	if (err)
 		return err;
 
-	if (system_config->debug_console.flags & JAILHOUSE_MEM_IO) {
+	/*
+	 * Make sure any permission changes on the per_cpu region can be
+	 * performed without allocations of page table pages.
+	 */
+	for (n = 0; n < hypervisor_header.max_cpus; n++) {
+		err = paging_map_all_per_cpu(n, true);
+		if (err)
+			return err;
+	}
+
+	if (CON_IS_MMIO(system_config->debug_console.flags)) {
 		vaddr = (unsigned long)hypervisor_header.debug_console_base;
 		/* check if console overlaps remapping region */
 		if (vaddr + system_config->debug_console.size >= REMAP_BASE &&
 		    vaddr < REMAP_BASE + remap_pool.pages * PAGE_SIZE)
 			return trace_error(-EINVAL);
 
+		flags = PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE;
+		if (system_config->debug_console.type ==
+		    JAILHOUSE_CON_TYPE_EFIFB)
+			flags = PAGE_DEFAULT_FLAGS | PAGE_FLAG_FRAMEBUFFER;
 		err = paging_create(&hv_paging_structs,
-				    system_config->debug_console.phys_start,
+				    system_config->debug_console.address,
 				    system_config->debug_console.size, vaddr,
-				    PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE,
-				    PAGING_NON_COHERENT);
+				    flags, PAGING_NON_COHERENT | PAGING_HUGE);
 		if (err)
 			return err;
 	}
 
-	/* Make sure any remappings to the temporary regions can be performed
-	 * without allocations of page table pages. */
-	return paging_create(&hv_paging_structs, 0,
-			     remap_pool.used_pages * PAGE_SIZE,
-			     TEMPORARY_MAPPING_BASE, PAGE_NONPRESENT_FLAGS,
-			     PAGING_NON_COHERENT);
+	return 0;
 }
 
 /**
@@ -541,7 +711,7 @@ int paging_init(void)
  */
 void paging_dump_stats(const char *when)
 {
-	printk("Page pool usage %s: mem %d/%d, remap %d/%d\n", when,
+	printk("Page pool usage %s: mem %ld/%ld, remap %ld/%ld\n", when,
 	       mem_pool.used_pages, mem_pool.pages,
 	       remap_pool.used_pages, remap_pool.pages);
 }

@@ -10,6 +10,7 @@
  * the COPYING file in the top-level directory.
  */
 
+#include <jailhouse/paging.h>
 #include <asm/asm-defines.h>
 
 /* SVM VM entry and handling of VM exit */
@@ -35,7 +36,7 @@ svm_vmentry:
 	push %r14
 	push %r15
 
-	lea -PERCPU_STACK_END+16*8(%rsp),%rdi
+	mov $LOCAL_CPU_BASE_ASM,%rdi
 	push %rax
 	call vcpu_handle_exit
 	pop %rax

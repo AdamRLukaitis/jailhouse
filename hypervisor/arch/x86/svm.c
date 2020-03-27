@@ -28,7 +28,7 @@
 #include <asm/control.h>
 #include <asm/iommu.h>
 #include <asm/paging.h>
-#include <asm/percpu.h>
+#include <jailhouse/percpu.h>
 #include <asm/processor.h>
 #include <asm/svm.h>
 #include <asm/vcpu.h>
@@ -64,16 +64,11 @@ static u8 __attribute__((aligned(PAGE_SIZE))) msrpm[][0x2000/4] = {
 		[  0x2fc/4 ...  0x2ff/4 ] = 0x80, /* 0x2ff (w) */
 		[  0x300/4 ...  0x7ff/4 ] = 0,
 		/* x2APIC MSRs - emulated if not present */
-		[  0x800/4 ...  0x803/4 ] = 0x90, /* 0x802 (r), 0x803 (r) */
+		[  0x800/4 ...  0x803/4 ] = 0x50, /* 0x802-0x803 (r) */
 		[  0x804/4 ...  0x807/4 ] = 0,
 		[  0x808/4 ...  0x80b/4 ] = 0x93, /* 0x808 (rw), 0x80a (r), 0x80b (w) */
 		[  0x80c/4 ...  0x80f/4 ] = 0xc8, /* 0x80d (w), 0x80f (rw) */
-		[  0x810/4 ...  0x813/4 ] = 0x55, /* 0x810 - 0x813 (r) */
-		[  0x814/4 ...  0x817/4 ] = 0x55, /* 0x814 - 0x817 (r) */
-		[  0x818/4 ...  0x81b/4 ] = 0x55, /* 0x818 - 0x81b (r) */
-		[  0x81c/4 ...  0x81f/4 ] = 0x55, /* 0x81c - 0x81f (r) */
-		[  0x820/4 ...  0x823/4 ] = 0x55, /* 0x820 - 0x823 (r) */
-		[  0x824/4 ...  0x827/4 ] = 0x55, /* 0x823 - 0x827 (r) */
+		[  0x810/4 ...  0x827/4 ] = 0x55, /* 0x810 - 0x827 (r) */
 		[  0x828/4 ...  0x82b/4 ] = 0x03, /* 0x828 (rw) */
 		[  0x82c/4 ...  0x82f/4 ] = 0xc0, /* 0x82f (rw) */
 		[  0x830/4 ...  0x833/4 ] = 0xf3, /* 0x830 (rw), 0x832 (rw), 0x833 (rw) */
@@ -94,16 +89,6 @@ static u8 __attribute__((aligned(PAGE_SIZE))) msrpm[][0x2000/4] = {
 		[      0/4 ... 0x1fff/4 ] = 0,
 	}
 };
-
-/* This page is mapped so the code begins at 0x000ffff0 */
-static u8 __attribute__((aligned(PAGE_SIZE))) parking_code[PAGE_SIZE] = {
-	[0xff0] = 0xfa, /* 1: cli */
-	[0xff1] = 0xf4, /*    hlt */
-	[0xff2] = 0xeb,
-	[0xff3] = 0xfc  /*    jmp 1b */
-};
-
-static void *parked_mode_npt;
 
 static void *avic_page;
 
@@ -144,7 +129,7 @@ static void set_svm_segment_from_segment(struct svm_segment *svm_segment,
 					 const struct segment *segment)
 {
 	svm_segment->selector = segment->selector;
-	svm_segment->access_rights = ((segment->access_rights & 0xf000) >> 4) |
+	svm_segment->attributes = ((segment->access_rights & 0xf000) >> 4) |
 		(segment->access_rights & 0x00ff);
 	svm_segment->limit = segment->limit;
 	svm_segment->base = segment->base;
@@ -152,7 +137,7 @@ static void set_svm_segment_from_segment(struct svm_segment *svm_segment,
 
 static void svm_set_cell_config(struct cell *cell, struct vmcb *vmcb)
 {
-	vmcb->iopm_base_pa = paging_hvirt2phys(cell->arch.svm.iopm);
+	vmcb->iopm_base_pa = paging_hvirt2phys(cell->arch.io_bitmap);
 	vmcb->n_cr3 =
 		paging_hvirt2phys(cell->arch.svm.npt_iommu_structs.root_table);
 }
@@ -212,8 +197,13 @@ static void vmcb_setup(struct per_cpu *cpu_data)
 	vmcb->general1_intercepts |= GENERAL1_INTERCEPT_MSR_PROT;
 	vmcb->general1_intercepts |= GENERAL1_INTERCEPT_SHUTDOWN_EVT;
 
-	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_VMRUN; /* Required */
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_VMRUN;
 	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_VMMCALL;
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_VMLOAD;
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_VMSAVE;
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_STGI;
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_CLGI;
+	vmcb->general2_intercepts |= GENERAL2_INTERCEPT_SKINIT;
 
 	/*
 	 * We only intercept #DB and #AC to prevent that malicious guests can
@@ -233,14 +223,13 @@ static void vmcb_setup(struct per_cpu *cpu_data)
 	/* Explicitly mark all of the state as new */
 	vmcb->clean_bits = 0;
 
-	svm_set_cell_config(cpu_data->cell, vmcb);
+	svm_set_cell_config(cpu_data->public.cell, vmcb);
 }
 
-unsigned long arch_paging_gphys2phys(struct per_cpu *cpu_data,
-				     unsigned long gphys,
+unsigned long arch_paging_gphys2phys(unsigned long gphys,
 				     unsigned long flags)
 {
-	return paging_virt2phys(&cpu_data->cell->arch.svm.npt_iommu_structs,
+	return paging_virt2phys(&this_cell()->arch.svm.npt_iommu_structs,
 				gphys, flags);
 }
 
@@ -283,9 +272,8 @@ static unsigned long npt_iommu_get_phys_l2(pt_entry_t pte, unsigned long virt)
 	return (*pte & BIT_MASK(51, 21)) | (virt & BIT_MASK(20, 0));
 }
 
-int vcpu_vendor_init(void)
+int vcpu_vendor_early_init(void)
 {
-	struct paging_structures parking_pt;
 	unsigned long vm_cr;
 	int err;
 
@@ -310,17 +298,7 @@ int vcpu_vendor_init(void)
 	npt_iommu_paging[1].get_phys = npt_iommu_get_phys_l3;
 	npt_iommu_paging[2].get_phys = npt_iommu_get_phys_l2;
 
-	/* Map guest parking code (shared between cells and CPUs) */
 	parking_pt.root_paging = npt_iommu_paging;
-	parking_pt.root_table = parked_mode_npt = page_alloc(&mem_pool, 1);
-	if (!parked_mode_npt)
-		return -ENOMEM;
-	err = paging_create(&parking_pt, paging_hvirt2phys(parking_code),
-			    PAGE_SIZE, 0x000ff000,
-			    PAGE_READONLY_FLAGS | PAGE_FLAG_US,
-			    PAGING_NON_COHERENT);
-	if (err)
-		return err;
 
 	/* This is always false for AMD now (except in nested SVM);
 	   see Sect. 16.3.1 in APMv2 */
@@ -342,13 +320,7 @@ int vcpu_vendor_init(void)
 
 int vcpu_vendor_cell_init(struct cell *cell)
 {
-	int err = -ENOMEM;
 	u64 flags;
-
-	/* allocate iopm  */
-	cell->arch.svm.iopm = page_alloc(&mem_pool, IOPM_PAGES);
-	if (!cell->arch.svm.iopm)
-		return err;
 
 	/* build root NPT of cell */
 	cell->arch.svm.npt_iommu_structs.root_paging = npt_iommu_paging;
@@ -360,51 +332,45 @@ int vcpu_vendor_cell_init(struct cell *cell)
 		 * Map xAPIC as is; reads are passed, writes are trapped.
 		 */
 		flags = PAGE_READONLY_FLAGS | PAGE_FLAG_US | PAGE_FLAG_DEVICE;
-		err = paging_create(&cell->arch.svm.npt_iommu_structs,
-				    XAPIC_BASE, PAGE_SIZE, XAPIC_BASE,
-				    flags, PAGING_NON_COHERENT);
+		return paging_create(&cell->arch.svm.npt_iommu_structs,
+				     XAPIC_BASE, PAGE_SIZE, XAPIC_BASE, flags,
+				     PAGING_NON_COHERENT | PAGING_NO_HUGE);
 	} else {
 		flags = PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE;
-		err = paging_create(&cell->arch.svm.npt_iommu_structs,
-				    paging_hvirt2phys(avic_page),
-				    PAGE_SIZE, XAPIC_BASE,
-				    flags, PAGING_NON_COHERENT);
+		return paging_create(&cell->arch.svm.npt_iommu_structs,
+				     paging_hvirt2phys(avic_page),
+				     PAGE_SIZE, XAPIC_BASE, flags,
+				     PAGING_NON_COHERENT | PAGING_NO_HUGE);
 	}
-	if (err)
-		goto err_free_iopm;
-
-	return 0;
-
-err_free_iopm:
-	page_free(&mem_pool, cell->arch.svm.iopm, 3);
-
-	return err;
 }
 
 int vcpu_map_memory_region(struct cell *cell,
 			   const struct jailhouse_memory *mem)
 {
 	u64 phys_start = mem->phys_start;
-	u64 flags = PAGE_FLAG_US; /* See APMv2, Section 15.25.5 */
+	u64 access_flags = PAGE_FLAG_US; /* See APMv2, Section 15.25.5 */
+	u64 paging_flags = PAGING_COHERENT | PAGING_HUGE;
 
 	if (mem->flags & JAILHOUSE_MEM_READ)
-		flags |= PAGE_FLAG_PRESENT;
+		access_flags |= PAGE_FLAG_PRESENT;
 	if (mem->flags & JAILHOUSE_MEM_WRITE)
-		flags |= PAGE_FLAG_RW;
+		access_flags |= PAGE_FLAG_RW;
 	if (!(mem->flags & JAILHOUSE_MEM_EXECUTE))
-		flags |= PAGE_FLAG_NOEXECUTE;
+		access_flags |= PAGE_FLAG_NOEXECUTE;
 	if (mem->flags & JAILHOUSE_MEM_COMM_REGION)
 		phys_start = paging_hvirt2phys(&cell->comm_page);
+	if (mem->flags & JAILHOUSE_MEM_NO_HUGEPAGES)
+		paging_flags &= ~PAGING_HUGE;
 
-	flags |= amd_iommu_get_memory_region_flags(mem);
+	access_flags |= amd_iommu_get_memory_region_flags(mem);
 
 	/*
 	 * As we also manipulate the IOMMU page table, changes need to be
 	 * coherent.
 	 */
 	return paging_create(&cell->arch.svm.npt_iommu_structs, phys_start,
-			     mem->size, mem->virt_start, flags,
-			     PAGING_COHERENT);
+			     mem->size, mem->virt_start, access_flags,
+			     paging_flags);
 }
 
 int vcpu_unmap_memory_region(struct cell *cell,
@@ -418,7 +384,6 @@ void vcpu_vendor_cell_exit(struct cell *cell)
 {
 	paging_destroy(&cell->arch.svm.npt_iommu_structs, XAPIC_BASE,
 		       PAGE_SIZE, PAGING_NON_COHERENT);
-	page_free(&mem_pool, cell->arch.svm.iopm, 3);
 }
 
 int vcpu_init(struct per_cpu *cpu_data)
@@ -451,13 +416,14 @@ int vcpu_init(struct per_cpu *cpu_data)
 	 * Note that the APM defines all reserved CR4 bits as must-be-zero.
 	 */
 	if (cpu_data->linux_cr0 & X86_CR0_RESERVED)
-		return -EIO;
+		return trace_error(-EIO);
 
 	/* bring CR0 and CR4 into well-defined states */
 	write_cr0(X86_CR0_HOST_STATE);
 	write_cr4(X86_CR4_HOST_STATE);
 
-	write_msr(MSR_VM_HSAVE_PA, paging_hvirt2phys(cpu_data->host_state));
+	write_msr(MSR_VM_HSAVE_PA,
+		  paging_hvirt2phys(per_cpu(this_cpu_id())->host_state));
 
 	return 0;
 }
@@ -481,11 +447,12 @@ void vcpu_exit(struct per_cpu *cpu_data)
 	write_msr(MSR_VM_HSAVE_PA, 0);
 }
 
-void __attribute__((noreturn)) vcpu_activate_vmm(struct per_cpu *cpu_data)
+void __attribute__((noreturn)) vcpu_activate_vmm(void)
 {
+	struct per_cpu *cpu_data = this_cpu_data();
 	unsigned long vmcb_pa, host_stack;
 
-	vmcb_pa = paging_hvirt2phys(&cpu_data->vmcb);
+	vmcb_pa = paging_hvirt2phys(&per_cpu(this_cpu_id())->vmcb);
 	host_stack = (unsigned long)cpu_data->stack + sizeof(cpu_data->stack);
 
 	/* We enter Linux at the point arch_entry would return to as well.
@@ -508,7 +475,8 @@ void __attribute__((noreturn)) vcpu_activate_vmm(struct per_cpu *cpu_data)
 
 void __attribute__((noreturn)) vcpu_deactivate_vmm(void)
 {
-	struct per_cpu *cpu_data = this_cpu_data();
+	/* use common per-cpu area - mandatory after arch_cpu_restore */
+	struct per_cpu *cpu_data = per_cpu(this_cpu_id());
 	struct vmcb *vmcb = &cpu_data->vmcb;
 	unsigned long *stack = (unsigned long *)vmcb->rsp;
 	unsigned long linux_ip = vmcb->rip;
@@ -535,7 +503,7 @@ void __attribute__((noreturn)) vcpu_deactivate_vmm(void)
 	asm volatile("mov %%fs,%0" : "=m" (cpu_data->linux_fs.selector));
 	asm volatile("mov %%gs,%0" : "=m" (cpu_data->linux_gs.selector));
 
-	arch_cpu_restore(cpu_data, 0);
+	arch_cpu_restore(this_cpu_id(), 0);
 
 	stack--;
 	*stack = linux_ip;
@@ -570,36 +538,41 @@ void vcpu_vendor_reset(unsigned int sipi_vector)
 		.selector = 0,
 		.base = 0,
 		.limit = 0xffff,
-		.access_rights = 0x0093,
+		.attributes = 0x0093,
 	};
 	static const struct svm_segment dtr_reset_state = {
 		.selector = 0,
 		.base = 0,
 		.limit = 0xffff,
-		.access_rights = 0,
+		.attributes = 0,
 	};
 	struct per_cpu *cpu_data = this_cpu_data();
 	struct vmcb *vmcb = &cpu_data->vmcb;
-	unsigned long val;
+	unsigned long vmcb_pa, reset_addr;
 
 	vmcb->cr0 = X86_CR0_NW | X86_CR0_CD | X86_CR0_ET;
 	vmcb->cr3 = 0;
 	vmcb->cr4 = 0;
 
 	vmcb->rflags = 0x02;
-
-	val = 0;
-	if (sipi_vector == APIC_BSP_PSEUDO_SIPI) {
-		val = 0xfff0;
-		sipi_vector = 0xf0;
-	}
-	vmcb->rip = val;
 	vmcb->rsp = 0;
 
-	vmcb->cs.selector = sipi_vector << 8;
-	vmcb->cs.base = sipi_vector << 12;
+	if (sipi_vector == APIC_BSP_PSEUDO_SIPI) {
+		reset_addr = this_cell()->config->cpu_reset_address;
+
+		vmcb->rip = reset_addr & 0xffff;
+
+		vmcb->cs.selector = (reset_addr >> 4) & 0xf000;
+		vmcb->cs.base = reset_addr & ~0xffffL;
+	} else {
+		vmcb->rip = 0;
+
+		vmcb->cs.selector = sipi_vector << 8;
+		vmcb->cs.base = sipi_vector << 12;
+	}
+
 	vmcb->cs.limit = 0xffff;
-	vmcb->cs.access_rights = 0x009b;
+	vmcb->cs.attributes = 0x009b;
 
 	vmcb->ds = dataseg_reset_state;
 	vmcb->es = dataseg_reset_state;
@@ -610,12 +583,12 @@ void vcpu_vendor_reset(unsigned int sipi_vector)
 	vmcb->tr.selector = 0;
 	vmcb->tr.base = 0;
 	vmcb->tr.limit = 0xffff;
-	vmcb->tr.access_rights = 0x008b;
+	vmcb->tr.attributes = 0x008b;
 
 	vmcb->ldtr.selector = 0;
 	vmcb->ldtr.base = 0;
 	vmcb->ldtr.limit = 0xffff;
-	vmcb->ldtr.access_rights = 0x0082;
+	vmcb->ldtr.attributes = 0x0082;
 
 	vmcb->gdtr = dtr_reset_state;
 	vmcb->idtr = dtr_reset_state;
@@ -639,11 +612,10 @@ void vcpu_vendor_reset(unsigned int sipi_vector)
 	/* Almost all of the guest state changed */
 	vmcb->clean_bits = 0;
 
-	svm_set_cell_config(cpu_data->cell, vmcb);
+	svm_set_cell_config(cpu_data->public.cell, vmcb);
 
-	asm volatile(
-		"vmload %%rax"
-		: : "a" (paging_hvirt2phys(vmcb)) : "memory");
+	vmcb_pa = paging_hvirt2phys(&per_cpu(this_cpu_id())->vmcb);
+	asm volatile("vmload %%rax" : : "a" (vmcb_pa) : "memory");
 	/* vmload overwrites GS_BASE - restore the host state */
 	write_msr(MSR_GS_BASE, (unsigned long)cpu_data);
 }
@@ -670,34 +642,22 @@ static void update_efer(struct vmcb *vmcb)
 	vmcb->clean_bits &= ~CLEAN_BITS_CRX;
 }
 
-bool vcpu_get_guest_paging_structs(struct guest_paging_structures *pg_structs)
+void vcpu_get_guest_paging_structs(struct guest_paging_structures *pg_structs)
 {
 	struct vmcb *vmcb = &this_cpu_data()->vmcb;
 
 	if (vmcb->efer & EFER_LMA) {
 		pg_structs->root_paging = x86_64_paging;
 		pg_structs->root_table_gphys = vmcb->cr3 & BIT_MASK(51, 12);
-	} else if ((vmcb->cr0 & X86_CR0_PG) &&
-		   !(vmcb->cr4 & X86_CR4_PAE)) {
+	} else if (!(vmcb->cr0 & X86_CR0_PG)) {
+		pg_structs->root_paging = NULL;
+	} else if (vmcb->cr4 & X86_CR4_PAE) {
+		pg_structs->root_paging = pae_paging;
+		pg_structs->root_table_gphys = vmcb->cr3 & BIT_MASK(31, 5);
+	} else {
 		pg_structs->root_paging = i386_paging;
 		pg_structs->root_table_gphys = vmcb->cr3 & BIT_MASK(31, 12);
-	} else if (!(vmcb->cr0 & X86_CR0_PG)) {
-		/*
-		 * Can be in non-paged protected mode as well, but
-		 * the translation mechanism will stay the same ayway.
-		 */
-		pg_structs->root_paging = realmode_paging;
-		/*
-		 * This will make paging_get_guest_pages map the page
-		 * that also contains the bootstrap code and, thus, is
-		 * always present in a cell.
-		 */
-		pg_structs->root_table_gphys = 0xff000;
-	} else {
-		printk("FATAL: Unsupported paging mode\n");
-		return false;
 	}
-	return true;
 }
 
 void vcpu_vendor_set_guest_pat(unsigned long val)
@@ -740,9 +700,9 @@ static bool svm_parse_mov_to_cr(struct vmcb *vmcb, unsigned long pc,
 	u8 opcodes[] = {0x0f, 0x22}, modrm;
 	int n;
 
+	vcpu_get_guest_paging_structs(&pg_structs);
+
 	ctx.remaining = ARRAY_SIZE(opcodes);
-	if (!vcpu_get_guest_paging_structs(&pg_structs))
-		return false;
 	ctx.cs_base = (vmcb->efer & EFER_LMA) ? 0 : vmcb->cs.base;
 
 	if (!ctx_advance(&ctx, &pc, &pg_structs))
@@ -817,6 +777,7 @@ static bool svm_handle_msr_write(struct per_cpu *cpu_data)
 	unsigned long efer;
 
 	if (cpu_data->guest_regs.rcx == MSR_EFER) {
+		cpu_data->public.stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR_OTHER]++;
 		/* Never let a guest to disable SVME; see APMv2, Sect. 3.1.7 */
 		efer = get_wrmsr_value(&cpu_data->guest_regs) | EFER_SVME;
 		/* Flush TLB on LME/NXE change: See APMv2, Sect. 15.16 */
@@ -848,11 +809,9 @@ static bool svm_handle_apic_access(struct vmcb *vmcb)
 	if (offset & 0x00f)
 		goto out_err;
 
-	if (!vcpu_get_guest_paging_structs(&pg_structs))
-		goto out_err;
+	vcpu_get_guest_paging_structs(&pg_structs);
 
-	inst_len = apic_mmio_access(vmcb->rip, &pg_structs, offset >> 4,
-				    is_write);
+	inst_len = apic_mmio_access(&pg_structs, offset >> 4, is_write);
 	if (!inst_len)
 		goto out_err;
 
@@ -867,18 +826,18 @@ out_err:
 
 static void dump_guest_regs(union registers *guest_regs, struct vmcb *vmcb)
 {
-	panic_printk("RIP: %p RSP: %p FLAGS: %x\n", vmcb->rip,
+	panic_printk("RIP: 0x%016llx RSP: 0x%016llx FLAGS: %llx\n", vmcb->rip,
 		     vmcb->rsp, vmcb->rflags);
-	panic_printk("RAX: %p RBX: %p RCX: %p\n", guest_regs->rax,
-		     guest_regs->rbx, guest_regs->rcx);
-	panic_printk("RDX: %p RSI: %p RDI: %p\n", guest_regs->rdx,
-		     guest_regs->rsi, guest_regs->rdi);
-	panic_printk("CS: %x BASE: %p AR-BYTES: %x EFER.LMA %d\n",
-		     vmcb->cs.selector, vmcb->cs.base, vmcb->cs.access_rights,
+	panic_printk("RAX: 0x%016lx RBX: 0x%016lx RCX: 0x%016lx\n",
+		     guest_regs->rax, guest_regs->rbx, guest_regs->rcx);
+	panic_printk("RDX: 0x%016lx RSI: 0x%016lx RDI: 0x%016lx\n",
+		     guest_regs->rdx, guest_regs->rsi, guest_regs->rdi);
+	panic_printk("CS: %x BASE: 0x%016llx AR-BYTES: %x EFER.LMA %d\n",
+		     vmcb->cs.selector, vmcb->cs.base, vmcb->cs.attributes,
 		     !!(vmcb->efer & EFER_LMA));
-	panic_printk("CR0: %p CR3: %p CR4: %p\n", vmcb->cr0,
-		     vmcb->cr3, vmcb->cr4);
-	panic_printk("EFER: %p\n", vmcb->efer);
+	panic_printk("CR0: 0x%016llx CR3: 0x%016llx CR4: 0x%016llx\n",
+		     vmcb->cr0, vmcb->cr3, vmcb->cr4);
+	panic_printk("EFER: 0x%016llx\n", vmcb->efer);
 }
 
 void vcpu_vendor_get_io_intercept(struct vcpu_io_intercept *io)
@@ -902,8 +861,14 @@ void vcpu_vendor_get_mmio_intercept(struct vcpu_mmio_intercept *mmio)
 	mmio->is_write = !!(vmcb->exitinfo1 & 0x2);
 }
 
+unsigned long vcpu_vendor_get_guest_cr4(void)
+{
+	return this_cpu_data()->vmcb.cr4;
+}
+
 void vcpu_handle_exit(struct per_cpu *cpu_data)
 {
+	struct public_per_cpu *cpu_public = &cpu_data->public;
 	struct vmcb *vmcb = &cpu_data->vmcb;
 	bool res = false;
 
@@ -912,7 +877,7 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 	/* Restore GS value expected by per_cpu data accessors */
 	write_msr(MSR_GS_BASE, (unsigned long)cpu_data);
 
-	cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_TOTAL]++;
+	cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_TOTAL]++;
 	/*
 	 * All guest state is marked unmodified; individual handlers must clear
 	 * the bits as needed.
@@ -921,11 +886,11 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 
 	switch (vmcb->exitcode) {
 	case VMEXIT_INVALID:
-		panic_printk("FATAL: VM-Entry failure, error %d\n",
+		panic_printk("FATAL: VM-Entry failure, error %lld\n",
 			     vmcb->exitcode);
 		break;
 	case VMEXIT_NMI:
-		cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_MANAGEMENT]++;
+		cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_MANAGEMENT]++;
 		/* Temporarily enable GIF to consume pending NMI */
 		asm volatile("stgi; clgi" : : : "memory");
 		x86_check_events();
@@ -934,7 +899,7 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 		vcpu_handle_hypercall();
 		goto vmentry;
 	case VMEXIT_CR0_SEL_WRITE:
-		cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_CR]++;
+		cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_CR]++;
 		if (svm_handle_cr(cpu_data))
 			goto vmentry;
 		break;
@@ -942,7 +907,6 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 		vcpu_handle_cpuid();
 		goto vmentry;
 	case VMEXIT_MSR:
-		cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR]++;
 		if (!vmcb->exitinfo1)
 			res = vcpu_handle_msr_read();
 		else
@@ -955,28 +919,24 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 		     vmcb->exitinfo2 >= XAPIC_BASE &&
 		     vmcb->exitinfo2 < XAPIC_BASE + PAGE_SIZE) {
 			/* APIC access in non-AVIC mode */
-			cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_XAPIC]++;
+			cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_XAPIC]++;
 			if (svm_handle_apic_access(vmcb))
 				goto vmentry;
 		} else {
 			/* General MMIO (IOAPIC, PCI etc) */
-			cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_MMIO]++;
+			cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_MMIO]++;
 			if (vcpu_handle_mmio_access())
 				goto vmentry;
 		}
 		break;
-	case VMEXIT_XSETBV:
-		if (vcpu_handle_xsetbv())
-			goto vmentry;
-		break;
 	case VMEXIT_IOIO:
-		cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_PIO]++;
+		cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_PIO]++;
 		if (vcpu_handle_io_access())
 			goto vmentry;
 		break;
 	case VMEXIT_EXCEPTION_DB:
 	case VMEXIT_EXCEPTION_AC:
-		cpu_data->stats[JAILHOUSE_CPU_STAT_VMEXITS_EXCEPTION]++;
+		cpu_public->stats[JAILHOUSE_CPU_STAT_VMEXITS_EXCEPTION]++;
 		/* Reinject exception, including error code if needed. */
 		vmcb->eventinj = (vmcb->exitcode - VMEXIT_EXCEPTION_DE) |
 			SVM_EVENTINJ_EXCEPTION | SVM_EVENTINJ_VALID;
@@ -988,8 +948,8 @@ void vcpu_handle_exit(struct per_cpu *cpu_data)
 		goto vmentry;
 	/* TODO: Handle VMEXIT_AVIC_NOACCEL and VMEXIT_AVIC_INCOMPLETE_IPI */
 	default:
-		panic_printk("FATAL: Unexpected #VMEXIT, exitcode %x, "
-			     "exitinfo1 %p exitinfo2 %p\n",
+		panic_printk("FATAL: Unexpected #VMEXIT, exitcode %llx, "
+			     "exitinfo1 0x%016llx exitinfo2 0x%016llx\n",
 			     vmcb->exitcode, vmcb->exitinfo1, vmcb->exitinfo2);
 	}
 	dump_guest_regs(&cpu_data->guest_regs, vmcb);
@@ -1001,10 +961,16 @@ vmentry:
 
 void vcpu_park(void)
 {
-	vcpu_vendor_reset(APIC_BSP_PSEUDO_SIPI);
+#ifdef CONFIG_CRASH_CELL_ON_PANIC
+	if (this_cpu_public()->failed) {
+		this_cpu_data()->vmcb.rip = 0;
+		return;
+	}
+#endif
+	vcpu_vendor_reset(0);
 	/* No need to clear VMCB Clean bit: vcpu_vendor_reset() already does
 	 * this. */
-	this_cpu_data()->vmcb.n_cr3 = paging_hvirt2phys(parked_mode_npt);
+	this_cpu_data()->vmcb.n_cr3 = paging_hvirt2phys(parking_pt.root_table);
 
 	vcpu_tlb_flush();
 }
@@ -1044,21 +1010,32 @@ const u8 *vcpu_get_inst_bytes(const struct guest_paging_structures *pg_structs,
 	}
 }
 
-void vcpu_vendor_get_cell_io_bitmap(struct cell *cell,
-		                    struct vcpu_io_bitmap *iobm)
+unsigned int vcpu_vendor_get_io_bitmap_pages(void)
 {
-	iobm->data = cell->arch.svm.iopm;
-	iobm->size = IOPM_PAGES * PAGE_SIZE;
+	return IOPM_PAGES;
 }
 
-void vcpu_vendor_get_execution_state(struct vcpu_execution_state *x_state)
-{
-	struct vmcb *vmcb = &this_cpu_data()->vmcb;
+#define VCPU_VENDOR_GET_REGISTER(__reg__)	\
+u64 vcpu_vendor_get_##__reg__(void)		\
+{						\
+	return this_cpu_data()->vmcb.__reg__;	\
+}
 
-	x_state->efer = vmcb->efer;
-	x_state->rflags = vmcb->rflags;
-	x_state->cs = vmcb->cs.selector;
-	x_state->rip = vmcb->rip;
+VCPU_VENDOR_GET_REGISTER(efer);
+VCPU_VENDOR_GET_REGISTER(rflags);
+VCPU_VENDOR_GET_REGISTER(rip);
+
+u16 vcpu_vendor_get_cs_attr(void)
+{
+	/*
+	 * Build the CS segment attributes from the L and D/B extracted from
+	 * the segment attribute field and the CPL from its own field. The
+	 * latter is suggested by the AMD spec (Vol 2, 15.5.1). Present the
+	 * result in Intel format.
+	 */
+	u16 l_db = this_cpu_data()->vmcb.cs.attributes & BIT_MASK(10, 9);
+
+	return (this_cpu_data()->vmcb.cpl << 5) | (l_db << 4);
 }
 
 /* GIF must be set for interrupts to be delivered (APMv2, Sect. 15.17) */

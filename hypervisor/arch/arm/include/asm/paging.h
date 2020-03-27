@@ -15,12 +15,11 @@
 
 #include <jailhouse/types.h>
 #include <jailhouse/utils.h>
+#include <asm/dcaches.h>
 #include <asm/processor.h>
 #include <asm/sysregs.h>
 
-#define PAGE_SIZE		4096
-#define PAGE_MASK		~(PAGE_SIZE - 1)
-#define PAGE_OFFS_MASK		(PAGE_SIZE - 1)
+#define PAGE_SHIFT		12
 
 #define MAX_PAGE_TABLE_LEVELS	3
 
@@ -30,11 +29,13 @@
  * by IPA[20:12].
  * This would allows to cover a 4GB memory map by using 4 concatenated level-2
  * page tables and thus provide better table walk performances.
- * For the moment, the core doesn't allow to use concatenated pages, so we will
- * use three levels instead, starting at level 1.
+ * For the moment, we will implement the first level for AArch32 using only
+ * one level.
  *
- * TODO: add a "u32 concatenated" field to the paging struct
+ * TODO: implement larger PARange support for AArch32
  */
+#define CELL_ROOT_PT_PAGES	1
+
 #if MAX_PAGE_TABLE_LEVELS < 3
 #define T0SZ			0
 #define SL0			0
@@ -117,6 +118,12 @@
 #define TCR_SL0_SHIFT		6
 #define TCR_S_SHIFT		4
 
+#define VTCR_CELL		(T0SZ | SL0 << TCR_SL0_SHIFT		\
+				| (TCR_RGN_WB_WA << TCR_IRGN0_SHIFT)	\
+				| (TCR_RGN_WB_WA << TCR_ORGN0_SHIFT)	\
+				| (TCR_INNER_SHAREABLE << TCR_SH0_SHIFT)\
+				| VTCR_RES1)
+
 /*
  * Hypervisor memory attribute indexes:
  *   0: normal WB, RA, WA, non-transient
@@ -146,6 +153,7 @@
 				| S1_PTE_ACCESS_EL0)
 
 /* Macros used by the core, only for the EL2 stage-1 mappings */
+#define PAGE_FLAG_FRAMEBUFFER	S1_PTE_FLAG_DEVICE
 #define PAGE_FLAG_DEVICE	S1_PTE_FLAG_DEVICE
 #define PAGE_DEFAULT_FLAGS	(S1_DEFAULT_FLAGS | S1_PTE_ACCESS_RW)
 #define PAGE_READONLY_FLAGS	(S1_DEFAULT_FLAGS | S1_PTE_ACCESS_RO)
@@ -154,14 +162,49 @@
 
 #define INVALID_PHYS_ADDR	(~0UL)
 
-#define REMAP_BASE		0x00100000UL
-#define NUM_REMAP_BITMAP_PAGES	1
-
+/**
+ * Location of per-CPU temporary mapping region in hypervisor address space.
+ */
+#define TEMPORARY_MAPPING_BASE	0x40000000UL
 #define NUM_TEMPORARY_PAGES	16
+
+#define REMAP_BASE		0xf8000000UL
+#define NUM_REMAP_BITMAP_PAGES	4
 
 #ifndef __ASSEMBLY__
 
+struct cell;
+struct paging_structures;
+
 typedef u64 *pt_entry_t;
+
+extern unsigned int cpu_parange;
+extern unsigned int cache_line_size;
+
+int arm_paging_cell_init(struct cell *cell);
+void arm_paging_cell_destroy(struct cell *cell);
+
+void arm_paging_vcpu_init(struct paging_structures *pg_structs);
+
+void arm_dcaches_clean_by_sw(void);
+
+static inline void arm_paging_vcpu_flush_tlbs(void)
+{
+	/*
+	 * Invalidate all stage-1 and 2 TLB entries for the current VMID
+	 * ERET will ensure completion of these ops
+	 */
+	arm_write_sysreg(TLBIALL, 0);
+}
+
+/* return the bits supported for the physical address range for this
+ * machine; in arch_paging_init this value will be kept in
+ * cpu_parange for later reference */
+static inline unsigned int get_cpu_parange(void)
+{
+	/* TODO: implement proper PARange support on AArch32 */
+	return 39;
+}
 
 /* Only executed on hypervisor paging struct changes */
 static inline void arch_paging_flush_page_tlbs(unsigned long page_addr)
@@ -170,21 +213,18 @@ static inline void arch_paging_flush_page_tlbs(unsigned long page_addr)
 	 * This instruction is UNDEF at EL1, but the whole TLB is invalidated
 	 * before enabling the EL2 stage 1 MMU anyway.
 	 */
-	if (is_el2())
+	if (is_el2()) {
+		dsb();
 		arm_write_sysreg(TLBIMVAH, page_addr & PAGE_MASK);
+		dsb();
+		isb();
+	}
 }
 
-extern unsigned int cache_line_size;
-
-/* Used to clean the PAGE_MAP_COHERENT page table changes */
+/* Used to clean the PAGING_COHERENT page table changes */
 static inline void arch_paging_flush_cpu_caches(void *addr, long size)
 {
-	do {
-		/* Clean & invalidate by MVA to PoC */
-		arm_write_sysreg(DCCIMVAC, addr);
-		size -= cache_line_size;
-		addr += cache_line_size;
-	} while (size > 0);
+	arm_dcaches_flush(addr, size, DCACHE_CLEAN);
 }
 
 #endif /* !__ASSEMBLY__ */

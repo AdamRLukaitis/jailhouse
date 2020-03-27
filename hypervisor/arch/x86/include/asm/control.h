@@ -10,7 +10,7 @@
  * the COPYING file in the top-level directory.
  */
 
-#include <asm/percpu.h>
+#include <jailhouse/percpu.h>
 
 struct exception_frame;
 
@@ -23,3 +23,5 @@ void x86_check_events(void);
 
 void __attribute__((noreturn))
 x86_exception_handler(struct exception_frame *frame);
+
+void arch_send_event(struct public_per_cpu *target_data);

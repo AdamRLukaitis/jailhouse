@@ -25,10 +25,15 @@
 /* leaf 0x01, ECX */
 #define X86_FEATURE_VMX					(1 << 5)
 #define X86_FEATURE_XSAVE				(1 << 26)
+#define X86_FEATURE_OSXSAVE				(1 << 27)
 #define X86_FEATURE_HYPERVISOR				(1 << 31)
 
 /* leaf 0x07, subleaf 0, EBX */
+#define X86_FEATURE_INVPCID				(1 << 10)
 #define X86_FEATURE_CAT					(1 << 15)
+
+/* leaf 0x0d, subleaf 1, EAX */
+#define X86_FEATURE_XSAVES				(1 << 3)
 
 /* leaf 0x80000001, ECX */
 #define X86_FEATURE_SVM					(1 << 2)
@@ -61,7 +66,7 @@
 #define X86_CR4_VMXE					(1UL << 13)
 #define X86_CR4_OSXSAVE					(1UL << 18)
 #define X86_CR4_RESERVED				\
-	(BIT_MASK(31, 22) | (1UL << 19) | (1UL << 15) | BIT_MASK(12, 11))
+	(BIT_MASK(31, 23) | (1UL << 19) | (1UL << 15) | (1UL << 12))
 
 #define X86_XCR0_FP					0x00000001
 
@@ -104,6 +109,8 @@
 #define FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX	(1 << 2)
 
 #define PAT_RESET_VALUE					0x0007040600070406UL
+/* PAT0: WB, PAT1: WC, PAT2: UC- */
+#define PAT_HOST_VALUE					0x070106UL
 
 #define MTRR_ENABLE					(1UL << 11)
 
@@ -122,7 +129,11 @@
 #define GDT_DESC_CODE					1
 #define GDT_DESC_TSS					2
 #define GDT_DESC_TSS_HI					3
-#define NUM_GDT_DESC					4
+/*
+ * Linux uses 16 entries, we only 4. But we need to be able to reload the Linux
+ * TSS from our GDT because Linux write-protects its GDT. So, leave some space.
+ */
+#define NUM_GDT_DESC					16
 
 #define X86_INST_LEN_CPUID				2
 #define X86_INST_LEN_RDMSR				2
@@ -134,8 +145,19 @@
 
 #define X86_REX_CODE					4
 
+#define X86_PREFIX_OP_SZ				0x66
+#define X86_PREFIX_ADDR_SZ				0x67
+
+#define X86_OP_MOVZX_OPC1				0x0f
+#define X86_OP_MOVZX_OPC2_B				0xb6
+#define X86_OP_MOVZX_OPC2_W				0xb7
+#define X86_OP_MOVB_TO_MEM				0x88
 #define X86_OP_MOV_TO_MEM				0x89
+#define X86_OP_MOVB_FROM_MEM				0x8a
 #define X86_OP_MOV_FROM_MEM				0x8b
+#define X86_OP_MOV_IMMEDIATE_TO_MEM			0xc7
+#define X86_OP_MOV_MEM_TO_AX    			0xa1
+#define X86_OP_MOV_AX_TO_MEM				0xa3
 
 #define DB_VECTOR					1
 #define NMI_VECTOR					2

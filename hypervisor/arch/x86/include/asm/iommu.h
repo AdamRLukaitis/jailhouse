@@ -19,16 +19,12 @@
 #include <jailhouse/pci.h>
 #include <jailhouse/types.h>
 #include <asm/apic.h>
-#include <asm/percpu.h>
+#include <jailhouse/percpu.h>
 
 extern unsigned int fault_reporting_cpu_id;
 
 unsigned int iommu_count_units(void);
-unsigned int iommu_mmio_count_regions(struct cell *cell);
 
-int iommu_init(void);
-
-int iommu_cell_init(struct cell *cell);
 int iommu_map_memory_region(struct cell *cell,
 			    const struct jailhouse_memory *mem);
 int iommu_unmap_memory_region(struct cell *cell,
@@ -45,13 +41,11 @@ int iommu_map_interrupt(struct cell *cell,
 			unsigned int vector,
 			struct apic_irq_message irq_msg);
 
-void iommu_cell_exit(struct cell *cell);
-
 void iommu_config_commit(struct cell *cell_added_removed);
 
-void iommu_shutdown(void);
+void iommu_prepare_shutdown(void);
 
-struct per_cpu *iommu_select_fault_reporting_cpu(void);
+struct public_per_cpu *iommu_select_fault_reporting_cpu(void);
 void iommu_check_pending_faults(void);
 
 bool iommu_cell_emulates_ir(struct cell *cell);

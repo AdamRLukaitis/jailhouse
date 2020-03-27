@@ -31,7 +31,7 @@
 #ifndef _JAILHOUSE_ASM_VMX_H
 #define _JAILHOUSE_ASM_VMX_H
 
-#include <asm/paging.h>
+#include <jailhouse/paging.h>
 
 struct per_cpu;
 
@@ -226,6 +226,8 @@ enum vmx_state { VMXOFF = 0, VMXON, VMCS_READY };
 #define SECONDARY_EXEC_ENABLE_EPT		(1UL << 1)
 #define SECONDARY_EXEC_RDTSCP			(1UL << 3)
 #define SECONDARY_EXEC_UNRESTRICTED_GUEST	(1UL << 7)
+#define SECONDARY_EXEC_INVPCID			(1UL << 12)
+#define SECONDARY_EXEC_XSAVES			(1UL << 20)
 
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE		(1UL << 9)
 #define VM_EXIT_SAVE_IA32_PAT			(1UL << 18)

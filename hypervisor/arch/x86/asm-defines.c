@@ -12,7 +12,7 @@
 
 #include <jailhouse/gen-defines.h>
 #include <jailhouse/utils.h>
-#include <asm/percpu.h>
+#include <jailhouse/percpu.h>
 #include <asm/svm.h>
 
 void common(void);
@@ -31,5 +31,6 @@ void common(void)
 	DEFINE(PERCPU_STACK_END,
 	       __builtin_offsetof(struct per_cpu, stack) + \
 	       FIELD_SIZEOF(struct per_cpu, stack));
-	DEFINE(PERCPU_SIZE_SHIFT_ASM, PERCPU_SIZE_SHIFT);
+	DEFINE(PERCPU_SIZE_ASM, sizeof(struct per_cpu));
+	DEFINE(LOCAL_CPU_BASE_ASM, LOCAL_CPU_BASE);
 }

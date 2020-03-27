@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2013
+ * Copyright (c) Siemens AG, 2013-2017
  *
  * Authors:
  *  Jan Kiszka <jan.kiszka@siemens.com>
@@ -10,10 +10,10 @@
  * the COPYING file in the top-level directory.
  */
 
-#include <asm/paging.h>
-#include <asm/sections.h>
+#include <jailhouse/header.h>
 
-#include <asm/jailhouse_hypercall.h>
+#include <jailhouse/paging.h>
+#include <asm/sections.h>
 
 SECTIONS
 {
@@ -21,8 +21,10 @@ SECTIONS
 	.header		: { *(.header) }
 
 	. = ALIGN(16);
-	__text_start = .;
-	.text		: { *(.text) }
+	.text		: {
+		__text_start = .;
+		*(.text)
+	}
 
 	. = ALIGN(16);
 	.rodata		: { *(.rodata) }
@@ -30,9 +32,30 @@ SECTIONS
 	. = ALIGN(16);
 	.data		: { *(.data) }
 
+	. = ALIGN(8);
+	.init_array	: {
+		__init_array_start = .;
+		*(SORT(.init_array.*)) *(.init_array)
+		__init_array_end = .;
+	}
+
+	.units		: {
+		__unit_array_start = .;
+		*(.units);
+		__unit_array_end = .;
+	}
+
 	ARCH_SECTIONS
 
-	. = ALIGN(16);
+	/* The console section shall only contain the hypervisor console. This
+	 * section and the next section must be aligned to PAGE_SIZE, as we
+	 * will map the console section, and only that section, as a whole page
+	 * to the root cell. */
+
+	. = ALIGN(PAGE_SIZE);
+	.console	: { *(.console) }
+
+	. = ALIGN(PAGE_SIZE);
 	.bss		: { *(.bss) }
 
 	. = ALIGN(PAGE_SIZE);

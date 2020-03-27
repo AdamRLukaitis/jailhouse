@@ -13,10 +13,6 @@
 #ifndef _JAILHOUSE_PAGING_H
 #define _JAILHOUSE_PAGING_H
 
-#include <jailhouse/entry.h>
-#include <jailhouse/types.h>
-#include <asm/paging.h>
-
 /**
  * @defgroup Paging Page Management Subsystem
  *
@@ -28,15 +24,34 @@
  * @{
  */
 
+/** Size of smallest page. */
+#define PAGE_SIZE		(1 << PAGE_SHIFT)
+/** Mask of bits selecting a page. */
+#define PAGE_MASK		~(PAGE_SIZE - 1)
+/** Mask of bits selecting an offset in a page. */
+#define PAGE_OFFS_MASK		(PAGE_SIZE - 1)
+
 /** Align address to page boundary (round up). */
 #define PAGE_ALIGN(s)		(((s) + PAGE_SIZE-1) & PAGE_MASK)
 /** Count number of pages for given size (round up). */
 #define PAGES(s)		(((s) + PAGE_SIZE-1) / PAGE_SIZE)
 
+/** Location of per-CPU data structure in hypervisor address space. */
+#define LOCAL_CPU_BASE		(TEMPORARY_MAPPING_BASE + \
+				 NUM_TEMPORARY_PAGES * PAGE_SIZE)
+/** @} */
+
+#include <asm/paging.h>
+
+#ifndef __ASSEMBLY__
+
+#include <jailhouse/entry.h>
+#include <jailhouse/types.h>
+
 /**
- * Location of per-CPU temporary mapping region in hypervisor address space.
+ * @ingroup Paging
+ * @{
  */
-#define TEMPORARY_MAPPING_BASE	REMAP_BASE
 
 /** Page pool state. */
 struct page_pool {
@@ -52,14 +67,21 @@ struct page_pool {
 	unsigned long flags;
 };
 
-/** Define coherency of page creation/destruction. */
-enum paging_coherent {
-	/** Make changes visible to non-snooping readers,
-	 * i.e. commit them to RAM. */
-	PAGING_COHERENT,
-	/** Do not force changes into RAM, i.e. avoid costly cache flushes. */
-	PAGING_NON_COHERENT,
-};
+/**
+ * @defgroup PAGING_FLAGS Paging creation/destruction flags
+ * @{
+ */
+
+/** Do not force changes into RAM, i.e. avoid costly cache flushes. */
+#define PAGING_NON_COHERENT	0
+/** Make changes visible to non-snooping readers, i.e. commit them to RAM. */
+#define PAGING_COHERENT		0x1
+
+/** Do not use huge pages for creating a mapping. */
+#define PAGING_NO_HUGE		0
+/** When possible, use huge pages for creating a mapping. */
+#define PAGING_HUGE		0x2
+/** @} */
 
 /** Page table reference. */
 typedef pt_entry_t page_table_t;
@@ -86,7 +108,7 @@ struct paging {
 	 * Returns true if entry is a valid and supports the provided access
 	 * flags (terminal and non-terminal entries).
 	 * @param pte Reference to page table entry.
-	 * @param flags Access flags to validate, see @ref PAGE_FLAGS.
+	 * @param flags Access flags to validate, see @ref PAGE_ACCESS_FLAGS.
 	 *
 	 * @return True if entry is valid.
 	 */
@@ -96,7 +118,7 @@ struct paging {
 	 * Set terminal entry to physical address and access flags.
 	 * @param pte Reference to page table entry.
 	 * @param phys Target physical address.
-	 * @param flags Flags of permitted access, see @ref PAGE_FLAGS.
+	 * @param flags Flags of permitted access, see @ref PAGE_ACCESS_FLAGS.
 	 */
 	void (*set_terminal)(pt_entry_t pte, unsigned long phys,
 			     unsigned long flags);
@@ -113,7 +135,7 @@ struct paging {
 	 * Extract access flags from given entry.
 	 * @param pte Reference to page table entry.
 	 *
-	 * @return Access flags, see @ref PAGE_FLAGS.
+	 * @return Access flags, see @ref PAGE_ACCESS_FLAGS.
 	 *
 	 * @note Only valid for terminal entries.
 	 */
@@ -152,10 +174,13 @@ struct paging {
 
 /** Describes the root of hierarchical paging structures. */
 struct paging_structures {
+	/** True if used for hypervisor itself. */
+	bool hv_paging;
 	/** Pointer to array of paging parameters and callbacks, first element
-	 * describing the root level. */
+	 * describing the root level, NULL if paging is disabled. */
 	const struct paging *root_paging;
-	/** Reference to root-level page table. */
+	/** Reference to root-level page table, ignored if root_paging is NULL.
+	 */
 	page_table_t root_table;
 };
 
@@ -179,10 +204,12 @@ extern struct page_pool mem_pool;
 extern struct page_pool remap_pool;
 
 extern struct paging_structures hv_paging_structs;
+extern struct paging_structures parking_pt;
 
 unsigned long paging_get_phys_invalid(pt_entry_t pte, unsigned long virt);
 
 void *page_alloc(struct page_pool *pool, unsigned int num);
+void *page_alloc_aligned(struct page_pool *pool, unsigned int num);
 void page_free(struct page_pool *pool, void *first_page, unsigned int num);
 
 /**
@@ -220,7 +247,6 @@ unsigned long paging_virt2phys(const struct paging_structures *pg_structs,
 
 /**
  * Translate guest-physical (cell) address into host-physical address.
- * @param cpu_data	CPU to use for the translation.
  * @param gphys		Guest-physical address to translate.
  * @param flags		Access flags to validate during the translation.
  *
@@ -232,19 +258,26 @@ unsigned long paging_virt2phys(const struct paging_structures *pg_structs,
  * @see paging_hvirt2phys
  * @see paging_virt2phys
  */
-unsigned long arch_paging_gphys2phys(struct per_cpu *cpu_data,
-				     unsigned long gphys, unsigned long flags);
+unsigned long arch_paging_gphys2phys(unsigned long gphys, unsigned long flags);
 
 int paging_create(const struct paging_structures *pg_structs,
-		    unsigned long phys, unsigned long size, unsigned long virt,
-		    unsigned long flags, enum paging_coherent coherent);
+		  unsigned long phys, unsigned long size, unsigned long virt,
+		  unsigned long access_flags, unsigned long paging_flags);
 int paging_destroy(const struct paging_structures *pg_structs,
 		   unsigned long virt, unsigned long size,
-		   enum paging_coherent coherent);
+		   unsigned long paging_flags);
+
+void *paging_map_device(unsigned long phys, unsigned long size);
+void paging_unmap_device(unsigned long phys, void *virt, unsigned long size);
+
+int paging_create_hvpt_link(const struct paging_structures *pg_dest_structs,
+			    unsigned long virt);
 
 void *paging_get_guest_pages(const struct guest_paging_structures *pg_structs,
 			     unsigned long gaddr, unsigned int num,
 			     unsigned long flags);
+
+int paging_map_all_per_cpu(unsigned int cpu, bool enable);
 
 int paging_init(void);
 
@@ -276,7 +309,7 @@ void paging_dump_stats(const char *when);
  */
 
 /**
- * @defgroup PAGE_FLAGS Page Access flags
+ * @defgroup PAGE_ACCESS_FLAGS Page Access flags
  * @{
  *
  * @def PAGE_DEFAULT_FLAGS
@@ -335,6 +368,8 @@ void paging_dump_stats(const char *when);
  *
  * @see arch_paging_flush_page_tlbs
  */
+
+#endif /* !__ASSEMBLY__ */
 
 /** @} */
 #endif /* !_JAILHOUSE_PAGING_H */

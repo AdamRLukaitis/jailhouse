@@ -8,40 +8,40 @@
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
+ *
+ * Alternatively, you can use or redistribute this file under the following
+ * BSD license:
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+ * THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <inmate.h>
-
-#define X86_CR0_PE		0x00000001
-#define X86_CR0_WP		0x00010000
-#define X86_CR0_PG		0x80000000
-
-#define X86_CR4_PSE		0x00000010
-
-#define MSR_MTRR_DEF_TYPE	0x000002ff
-#define MTRR_ENABLE		0x00000800
-
-	.code16
-	.section ".boot", "ax"
-
-	.globl __reset_entry
-__reset_entry:
-	ljmp $0xf000,$start16
-
-
-	.section ".startup", "ax"
-
-start16:
-	lgdtl %cs:gdt_ptr
-
-	mov %cr0,%eax
-	or $X86_CR0_PE,%al
-	mov %eax,%cr0
-
-	ljmpl $INMATE_CS32,$start32 + FSEGMENT_BASE
-
+#include <asm/regs.h>
 
 	.code32
+	.section ".boot", "ax"
+	.globl start32
 start32:
 	mov %cr4,%eax
 	or $X86_CR4_PSE,%eax
@@ -69,12 +69,12 @@ start32:
 	jnz call_entry
 
 	mov $1,%edi
-	lock xadd %edi,cpu_number + FSEGMENT_BASE
+	lock xadd %edi,cpu_number
 
 	cmp $SMP_MAX_CPUS,%edi
 	jae stop
 
-	mov $0x01,%eax
+	mov $X86_CPUID_FEATURES, %eax
 	cpuid
 	shr $24,%ebx
 	mov %bl,smp_cpu_ids(%edi)
@@ -89,10 +89,14 @@ start32:
 	mov $bss_dwords,%ecx
 	rep stosl
 
-	mov $inmate_main,%ebx
+	mov $c_entry,%ebx
 
 call_entry:
-	mov $stack_top,%esp
+	xor %esp, %esp
+	xchg stack, %esp
+
+	call arch_init_features
+
 	call *%ebx
 
 stop:	cli
@@ -127,9 +131,10 @@ loader_gdt:
 	.quad	0x00af9b000000ffff
 	.quad	0x00cf93000000ffff
 
+	.globl gdt_ptr
 gdt_ptr:
 	.short	gdt_ptr - loader_gdt - 1
-	.long	loader_gdt + FSEGMENT_BASE
+	.long	loader_gdt
 
 
 	.section ".rodata"

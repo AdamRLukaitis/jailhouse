@@ -10,13 +10,16 @@
  * the COPYING file in the top-level directory.
  */
 
-#include <asm/bitops.h>
-#include <asm/percpu.h>
+#include <jailhouse/bitops.h>
+#include <jailhouse/percpu.h>
 #include <jailhouse/cell.h>
 #include <jailhouse/cell-config.h>
 
 #define SHUTDOWN_NONE			0
 #define SHUTDOWN_STARTED		1
+
+extern volatile unsigned long panic_in_progress;
+extern unsigned long panic_cpu;
 
 /**
  * @defgroup Control Control Subsystem
@@ -34,6 +37,14 @@ unsigned int next_cpu(unsigned int cpu, struct cpu_set *cpu_set,
 		      int exception);
 
 /**
+ * Get the first CPU in a given set.
+ * @param set		CPU set.
+ *
+ * @return First CPU in set, or max_cpu_id + 1 if the set is empty.
+ */
+#define first_cpu(set)		next_cpu(-1, (set), -1)
+
+/**
  * Loop-generating macro for iterating over all CPUs in a set.
  * @param cpu		Iteration variable holding the current CPU ID
  * 			(unsigned int).
@@ -41,11 +52,7 @@ unsigned int next_cpu(unsigned int cpu, struct cpu_set *cpu_set,
  *
  * @see for_each_cpu_except
  */
-#define for_each_cpu(cpu, set)					\
-	for ((cpu) = -1;					\
-	     (cpu) = next_cpu((cpu), (set), -1),		\
-	     (cpu) <= (set)->max_cpu_id;			\
-	    )
+#define for_each_cpu(cpu, set)	for_each_cpu_except(cpu, set, -1)
 
 /**
  * Loop-generating macro for iterating over all CPUs in a set, except the
@@ -118,29 +125,10 @@ void config_commit(struct cell *cell_added_removed);
 
 long hypercall(unsigned long code, unsigned long arg1, unsigned long arg2);
 
+void shutdown(void);
+
 void __attribute__((noreturn)) panic_stop(void);
 void panic_park(void);
-
-/**
- * Suspend a remote CPU.
- * @param cpu_id	ID of the target CPU.
- *
- * Suspension means that the target CPU is no longer executing cell code or
- * arbitrary hypervisor code. It may actively wait in the hypervisor context,
- * so the suspension time should be kept short.
- *
- * The function waits for the target CPU to enter suspended state.
- *
- * This service can be used to synchronize with other CPUs before performing
- * management tasks.
- *
- * @note This function must not be invoked for the caller's CPU.
- *
- * @see arch_resume_cpu
- * @see arch_reset_cpu
- * @see arch_park_cpu
- */
-void arch_suspend_cpu(unsigned int cpu_id);
 
 /**
  * Resume a suspended remote CPU.
@@ -148,9 +136,9 @@ void arch_suspend_cpu(unsigned int cpu_id);
  *
  * @note This function must not be invoked for the caller's CPU.
  *
- * @see arch_suspend_cpu
+ * @see suspend_cpu
  */
-void arch_resume_cpu(unsigned int cpu_id);
+void resume_cpu(unsigned int cpu_id);
 
 /**
  * Reset a suspended remote CPU and resumes its execution.
@@ -162,7 +150,7 @@ void arch_resume_cpu(unsigned int cpu_id);
  * @note This function must not be invoked for the caller's CPU or if the
  * target CPU is not in suspend state.
  *
- * @see arch_suspend_cpu
+ * @see suspend_cpu
  */
 void arch_reset_cpu(unsigned int cpu_id);
 
@@ -181,24 +169,9 @@ void arch_reset_cpu(unsigned int cpu_id);
  * @note This function must not be invoked for the caller's CPU or if the
  * target CPU is not in suspend state.
  *
- * @see arch_suspend_cpu
+ * @see suspend_cpu
  */
 void arch_park_cpu(unsigned int cpu_id);
-
-/**
- * Releases hypervisor control over the target CPU.
- * @param cpu_id	ID of the target CPU.
- *
- * @note This function must not be invoked for the caller's CPU.
- *
- * @note The target CPU need not be suspended before calling the function.
- *
- * @note The caller has to ensure that the target CPU has enough time to reach
- * the shutdown position before destroying the code path it has to take to get
- * there. This can be ensured by bringing the CPU online again under Linux
- * before cleaning up the hypervisor.
- */
-void arch_shutdown_cpu(unsigned int cpu_id);
 
 /**
  * Performs the architecture-specific steps for mapping a memory region into a
@@ -233,7 +206,7 @@ int arch_unmap_memory_region(struct cell *cell,
  * got restricted, and the cell should keep running.
  * @param cell		Cell for which the caches should get flushed
  *
- * @see per_cpu::flush_vcpu_caches
+ * @see public_per_cpu::flush_vcpu_caches
  */
 void arch_flush_cell_vcpu_caches(struct cell *cell);
 
@@ -256,6 +229,17 @@ int arch_cell_create(struct cell *cell);
 void arch_cell_destroy(struct cell *cell);
 
 /**
+ * Performs the architecture-specific steps for resetting a cell.
+ * @param cell		Cell to be reset.
+ *
+ * @note This function shall not reset individual cell CPUs. Instead, this is
+ * triggered by the core via arch_reset_cpu().
+ *
+ * @see arch_reset_cpu
+ */
+void arch_cell_reset(struct cell *cell);
+
+/**
  * Performs the architecture-specific steps for applying configuration changes.
  * @param cell_added_removed	Cell that was added or removed to/from the
  * 				system or NULL.
@@ -266,9 +250,9 @@ void arch_cell_destroy(struct cell *cell);
 void arch_config_commit(struct cell *cell_added_removed);
 
 /**
- * Shutdown architecture-specific subsystems while disabling the hypervisor.
+ * Architecture-specific preparations before shutting down the hypervisor.
  */
-void arch_shutdown(void);
+void arch_prepare_shutdown(void);
 
 /**
  * Performs the architecture-specifc steps to stop the current CPU on panic.

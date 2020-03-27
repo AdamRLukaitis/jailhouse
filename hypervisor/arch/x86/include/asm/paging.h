@@ -14,31 +14,41 @@
 #define _JAILHOUSE_ASM_PAGING_H
 
 #include <jailhouse/types.h>
+#include <jailhouse/utils.h>
 #include <asm/processor.h>
 
-#define PAGE_SIZE		4096
-#define PAGE_MASK		~(PAGE_SIZE - 1)
-#define PAGE_OFFS_MASK		(PAGE_SIZE - 1)
+#define PAGE_SHIFT		12
 
 #define MAX_PAGE_TABLE_LEVELS	4
 
 #define PAGE_FLAG_PRESENT	0x01
 #define PAGE_FLAG_RW		0x02
 #define PAGE_FLAG_US		0x04
+#define PAGE_FLAG_FRAMEBUFFER	0x08	/* write-combining */
 #define PAGE_FLAG_DEVICE	0x10	/* uncached */
 #define PAGE_FLAG_NOEXECUTE	0x8000000000000000UL
 
 #define PAGE_DEFAULT_FLAGS	(PAGE_FLAG_PRESENT | PAGE_FLAG_RW)
 #define PAGE_READONLY_FLAGS	PAGE_FLAG_PRESENT
 #define PAGE_PRESENT_FLAGS	PAGE_FLAG_PRESENT
-#define PAGE_NONPRESENT_FLAGS	0
+/*
+ * Set the higher physical address bits so that non-present mappings point to a
+ * non-existing physical address, hardening against the L1TF disaster.
+ */
+#define PAGE_NONPRESENT_FLAGS	(INVALID_PHYS_ADDR & BIT_MASK(51, 30))
 
 #define INVALID_PHYS_ADDR	(~0UL)
 
-#define REMAP_BASE		0x0000000000100000UL
+/**
+ * Location of per-CPU temporary mapping region in hypervisor address space.
+ */
+#define TEMPORARY_MAPPING_BASE	0x0000008000000000UL
+#define NUM_TEMPORARY_PAGES	16
+
+#define REMAP_BASE		0xffffff8000000000UL
 #define NUM_REMAP_BITMAP_PAGES	4
 
-#define NUM_TEMPORARY_PAGES	16
+#define CELL_ROOT_PT_PAGES	1
 
 #ifndef __ASSEMBLY__
 

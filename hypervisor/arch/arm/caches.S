@@ -11,19 +11,15 @@
  */
 
 #include <asm/control.h>
-#include <asm/head.h>
 #include <asm/sysregs.h>
 
 /*
  * Clean the whole data cache
  * Taken from the ARM ARM example code (B2.2.7)
- * r0: 0 - clean
- *     1 - clean + invalidate
  */
-	.global arch_cpu_dcaches_flush
-arch_cpu_dcaches_flush:
-	push	{r0-r11}
-	mov	r11, r0
+	.global arm_dcaches_clean_by_sw
+arm_dcaches_clean_by_sw:
+	push	{r0-r10}
 
 	dsb
 	arm_read_sysreg(CLIDR_EL1, r0)
@@ -58,12 +54,8 @@ loop_ways:
 	orr	r10, r9, r8, lsl r5	@ Factor in the way and cache numbers
 	orr	r10, r10, r7, lsl r2	@ Factor in the index number
 
-	cmp	r11, #CACHES_CLEAN
-	bne	1f
-	arm_write_sysreg(DCCSW, r10)	@ Clean
-	b	2f
-1:	arm_write_sysreg(DCCISW, r10)	@ Clean+Invalidate
-2:
+	arm_write_sysreg(DCCSW, r10)
+
 	subs	r7, r7, #1		@ decrement index
 	bge	loop_ways
 	subs	r8, r8, #1		@ decrement way
@@ -76,13 +68,5 @@ next_cache:
 	dsb
 
 finish:	isb
-	pop	{r0-r11}
-	bx	lr
-
-	.global arch_cpu_icache_flush
-arch_cpu_icache_flush:
-	dsb
-	arm_write_sysreg(ICIALLU, r0)	@ r0 value is ignored
-	dsb
-	isb
+	pop	{r0-r10}
 	bx	lr

@@ -1,36 +1,32 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) ARM Limited, 2014
+ * Copyright (c) Siemens AG, 2016
  *
  * Authors:
- *  Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
+ *  Jan Kiszka <jan.kiszka@siemens.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
  */
 
-#include <jailhouse/processor.h>
-#include <jailhouse/string.h>
 #include <jailhouse/types.h>
-#include <asm/sysregs.h>
 
-int phys_processor_id(void)
+unsigned long long __aeabi_llsl(unsigned long long val, unsigned int shift);
+unsigned long long __aeabi_llsr(unsigned long long val, unsigned int shift);
+
+unsigned long long __aeabi_llsl(unsigned long long val, unsigned int shift)
 {
-	u32 mpidr;
+	u32 lo = (u32)val << shift;
+	u32 hi = ((u32)(val >> 32) << shift) | ((u32)val >> (32 - shift));
 
-	arm_read_sysreg(MPIDR_EL1, mpidr);
-	return mpidr & MPIDR_CPUID_MASK;
+	return ((unsigned long long)hi << 32) | lo;
 }
 
-void *memcpy(void *dest, const void *src, unsigned long n)
+unsigned long long __aeabi_llsr(unsigned long long val, unsigned int shift)
 {
-	unsigned long i;
-	const char *csrc = src;
-	char *cdest = dest;
+	u32 lo = ((u32)val >> shift) | ((u32)(val >> 32) << (32 - shift));
+	u32 hi = (u32)val >> shift;
 
-	for (i = 0; i < n; i++)
-		cdest[i] = csrc[i];
-
-	return dest;
+	return ((unsigned long long)hi << 32) | lo;
 }

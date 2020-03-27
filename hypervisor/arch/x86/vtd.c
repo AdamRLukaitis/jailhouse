@@ -13,16 +13,20 @@
  */
 
 #include <jailhouse/control.h>
+#include <jailhouse/ivshmem.h>
 #include <jailhouse/mmio.h>
 #include <jailhouse/paging.h>
 #include <jailhouse/pci.h>
 #include <jailhouse/printk.h>
 #include <jailhouse/string.h>
+#include <jailhouse/unit.h>
 #include <asm/apic.h>
 #include <asm/iommu.h>
-#include <asm/bitops.h>
 #include <asm/ioapic.h>
 #include <asm/spinlock.h>
+
+#define VTD_INTERRUPT_LIMIT()	\
+	system_config->platform_info.x86.vtd_interrupt_limit
 
 #define VTD_ROOT_PRESENT		0x00000001
 
@@ -48,7 +52,6 @@ struct vtd_entry {
 # define VTD_VER_MIN			0x10
 #define VTD_CAP_REG			0x08
 # define VTD_CAP_NUM_DID_MASK		BIT_MASK(2, 0)
-# define VTD_CAP_CM			(1UL << 7)
 # define VTD_CAP_SAGAW39		(1UL << 9)
 # define VTD_CAP_SAGAW48		(1UL << 10)
 # define VTD_CAP_SLLPS2M		(1UL << 34)
@@ -197,11 +200,11 @@ static void *unit_inv_queue;
 static unsigned int dmar_units;
 static unsigned int dmar_pt_levels;
 static unsigned int dmar_num_did = ~0U;
-static DEFINE_SPINLOCK(inv_queue_lock);
+static spinlock_t inv_queue_lock;
 static struct vtd_emulation root_cell_units[JAILHOUSE_MAX_IOMMU_UNITS];
 static bool dmar_units_initialized;
 
-unsigned int iommu_mmio_count_regions(struct cell *cell)
+static unsigned int vtd_mmio_count_regions(struct cell *cell)
 {
 	return cell == &root_cell ? iommu_count_units() : 0;
 }
@@ -220,13 +223,15 @@ static unsigned int inv_queue_write(void *inv_queue, unsigned int index,
 static void vtd_submit_iq_request(void *reg_base, void *inv_queue,
 				  const struct vtd_entry *inv_request)
 {
-	volatile u32 completed = 0;
 	struct vtd_entry inv_wait = {
 		.lo_word = VTD_REQ_INV_WAIT | VTD_INV_WAIT_SW |
 			VTD_INV_WAIT_FN | (1UL << VTD_INV_WAIT_SDATA_SHIFT),
-		.hi_word = paging_hvirt2phys(&completed),
+		.hi_word = paging_hvirt2phys(
+				&per_cpu(this_cpu_id())->vtd_iq_completed),
 	};
 	unsigned int index;
+
+	this_cpu_data()->vtd_iq_completed = 0;
 
 	spin_lock(&inv_queue_lock);
 
@@ -238,7 +243,7 @@ static void vtd_submit_iq_request(void *reg_base, void *inv_queue,
 
 	mmio_write64_field(reg_base + VTD_IQT_REG, VTD_IQT_QT_MASK, index);
 
-	while (!completed)
+	while (!this_cpu_data()->vtd_iq_completed)
 		cpu_relax();
 
 	spin_unlock(&inv_queue_lock);
@@ -291,15 +296,15 @@ static void vtd_set_next_pt(pt_entry_t pte, unsigned long next_pt)
 static void vtd_init_fault_nmi(void)
 {
 	union x86_msi_vector msi = { .native.address = MSI_ADDRESS_VALUE };
+	struct public_per_cpu *target_data;
 	void *reg_base = dmar_reg_base;
-	struct per_cpu *cpu_data;
 	unsigned int n;
 
 	/* Pick a suitable root cell CPU to report faults. */
-	cpu_data = iommu_select_fault_reporting_cpu();
+	target_data = iommu_select_fault_reporting_cpu();
 
 	/* We only support 8-bit APIC IDs. */
-	msi.native.destination = (u8)cpu_data->apic_id;
+	msi.native.destination = (u8)target_data->apic_id;
 
 	for (n = 0; n < dmar_units; n++, reg_base += DMAR_MMIO_SIZE) {
 		/* Mask events */
@@ -328,7 +333,7 @@ static void vtd_init_fault_nmi(void)
 	 * not be reported. Address this by triggering an NMI on the new
 	 * reporting CPU.
 	 */
-	apic_send_nmi_ipi(cpu_data);
+	apic_send_nmi_ipi(target_data);
 }
 
 static void *vtd_get_fault_rec_reg_addr(void *reg_base)
@@ -392,8 +397,9 @@ static int vtd_emulate_inv_int(unsigned int unit_no, unsigned int index)
 		return 0;
 
 	device = pci_get_assigned_device(&root_cell, irte_usage->device_id);
+	/* On x86, ivshmem devices only support MSI-X. */
 	if (device && device->info->type == JAILHOUSE_PCI_TYPE_IVSHMEM)
-		return pci_ivshmem_update_msix(device);
+		return ivshmem_update_msix_vector(device, irte_usage->vector);
 
 	irq_msg = iommu_get_remapped_root_int(unit_no, irte_usage->device_id,
 					      irte_usage->vector, index);
@@ -405,7 +411,7 @@ static int vtd_emulate_qi_request(unsigned int unit_no,
 				  struct vtd_entry inv_desc)
 {
 	unsigned int start, count, n;
-	void *status_page;
+	void *status_addr;
 	int result;
 
 	switch (inv_desc.lo_word & VTD_REQ_INV_MASK) {
@@ -431,13 +437,14 @@ static int vtd_emulate_qi_request(unsigned int unit_no,
 		    !(inv_desc.lo_word & VTD_INV_WAIT_SW))
 			return -EINVAL;
 
-		status_page = paging_get_guest_pages(NULL, inv_desc.hi_word, 1,
+		status_addr = paging_get_guest_pages(NULL, inv_desc.hi_word, 1,
 						     PAGE_DEFAULT_FLAGS);
-		if (!status_page)
+		if (!status_addr)
 			return -EINVAL;
 
-		*(u32 *)(status_page + (inv_desc.hi_word & ~PAGE_MASK)) =
-			inv_desc.lo_word >> 32;
+		status_addr += inv_desc.hi_word & PAGE_OFFS_MASK & ~3;
+		*(u32 *)status_addr =
+			inv_desc.lo_word >> VTD_INV_WAIT_SDATA_SHIFT;
 
 		return 0;
 	}
@@ -475,7 +482,8 @@ static enum mmio_result vtd_unit_access_handler(void *arg,
 		return MMIO_HANDLED;
 	}
 	if (mmio->address == VTD_IQT_REG && mmio->is_write) {
-		while (unit->iqh != (mmio->value & ~PAGE_MASK)) {
+		while (unit->iqh !=
+		       (mmio->value & VTD_IQT_QT_MASK & PAGE_OFFS_MASK)) {
 			inv_desc_page =
 				paging_get_guest_pages(NULL, unit->iqa, 1,
 						       PAGE_READONLY_FLAGS);
@@ -489,17 +497,17 @@ static enum mmio_result vtd_unit_access_handler(void *arg,
 				goto invalid_iq_entry;
 
 			unit->iqh += 1 << VTD_IQH_QH_SHIFT;
-			unit->iqh &= ~PAGE_MASK;
+			unit->iqh &= PAGE_OFFS_MASK;
 		}
 		return MMIO_HANDLED;
 	}
-	panic_printk("FATAL: Unhandled DMAR unit %s access, register %02x\n",
+	panic_printk("FATAL: Unhandled DMAR unit %s access, register %02lx\n",
 		     mmio->is_write ? "write" : "read", mmio->address);
 	return MMIO_ERROR;
 
 invalid_iq_entry:
 	panic_printk("FATAL: Invalid/unsupported invalidation queue entry\n");
-	return -1;
+	return MMIO_ERROR;
 }
 
 static void vtd_init_unit(void *reg_base, void *inv_queue)
@@ -548,155 +556,6 @@ static void vtd_init_unit(void *reg_base, void *inv_queue)
 	vtd_update_gcmd_reg(reg_base, VTD_GCMD_IRE, 1);
 }
 
-static int vtd_init_ir_emulation(unsigned int unit_no, void *reg_base)
-{
-	struct vtd_emulation *unit = &root_cell_units[unit_no];
-	unsigned long base, size;
-	unsigned int n;
-	u64 iqt;
-
-	root_cell.arch.vtd.ir_emulation = true;
-
-	base = system_config->platform_info.x86.iommu_units[unit_no].base;
-	mmio_region_register(&root_cell, base, PAGE_SIZE,
-			     vtd_unit_access_handler, unit);
-
-	unit->irta = mmio_read64(reg_base + VTD_IRTA_REG);
-	unit->irt_entries = 2 << (unit->irta & VTD_IRTA_SIZE_MASK);
-
-	size = PAGE_ALIGN(sizeof(struct vtd_irte_usage) * unit->irt_entries);
-	unit->irte_map = page_alloc(&mem_pool, size / PAGE_SIZE);
-	if (!unit->irte_map)
-		return -ENOMEM;
-
-	iqt = mmio_read64(reg_base + VTD_IQT_REG);
-	while (mmio_read64(reg_base + VTD_IQH_REG) != iqt)
-		cpu_relax();
-	unit->iqh = iqt;
-
-	unit->iqa = mmio_read64(reg_base + VTD_IQA_REG);
-	if (unit->iqa & ~VTD_IQA_ADDR_MASK)
-		return trace_error(-EIO);
-
-	for (n = 0; n < ARRAY_SIZE(unit->fault_event_regs); n++)
-		unit->fault_event_regs[n] =
-			mmio_read32(reg_base + VTD_FECTL_REG + n * 4);
-
-	return 0;
-}
-
-int iommu_init(void)
-{
-	unsigned long version, caps, ecaps, ctrls, sllps_caps = ~0UL;
-	unsigned int units, pt_levels, num_did, n;
-	struct jailhouse_iommu *unit;
-	void *reg_base;
-	int err;
-
-	/* n = roundup(log2(system_config->interrupt_limit)) */
-	for (n = 0; (1UL << n) < (system_config->interrupt_limit); n++)
-		; /* empty loop */
-	if (n >= 16)
-		return trace_error(-EINVAL);
-
-	int_remap_table =
-		page_alloc(&mem_pool, PAGES(sizeof(union vtd_irte) << n));
-	if (!int_remap_table)
-		return -ENOMEM;
-
-	int_remap_table_size_log2 = n;
-
-	units = iommu_count_units();
-	if (units == 0)
-		return trace_error(-EINVAL);
-
-	dmar_reg_base = page_alloc(&remap_pool, units * PAGES(DMAR_MMIO_SIZE));
-	if (!dmar_reg_base)
-		return trace_error(-ENOMEM);
-
-	unit_inv_queue = page_alloc(&mem_pool, units);
-	if (!unit_inv_queue)
-		return -ENOMEM;
-
-	for (n = 0; n < units; n++) {
-		unit = &system_config->platform_info.x86.iommu_units[n];
-
-		reg_base = dmar_reg_base + n * DMAR_MMIO_SIZE;
-
-		err = paging_create(&hv_paging_structs, unit->base, unit->size,
-				    (unsigned long)reg_base,
-				    PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE,
-				    PAGING_NON_COHERENT);
-		if (err)
-			return err;
-
-		version = mmio_read64(reg_base + VTD_VER_REG) & VTD_VER_MASK;
-		if (version < VTD_VER_MIN || version == 0xff) {
-			//return -EIO;
-			// HACK for QEMU
-			printk("WARNING: No VT-d support found!\n");
-			return 0;
-		}
-
-		printk("DMAR unit @0x%lx/0x%x\n", unit->base, unit->size);
-
-		caps = mmio_read64(reg_base + VTD_CAP_REG);
-		if (caps & VTD_CAP_SAGAW39)
-			pt_levels = 3;
-		else if (caps & VTD_CAP_SAGAW48)
-			pt_levels = 4;
-		else
-			return trace_error(-EIO);
-		sllps_caps &= caps;
-
-		if (dmar_pt_levels > 0 && dmar_pt_levels != pt_levels)
-			return trace_error(-EIO);
-		dmar_pt_levels = pt_levels;
-
-		if (caps & VTD_CAP_CM)
-			return trace_error(-EIO);
-
-		ecaps = mmio_read64(reg_base + VTD_ECAP_REG);
-		if (!(ecaps & VTD_ECAP_QI) || !(ecaps & VTD_ECAP_IR) ||
-		    (using_x2apic && !(ecaps & VTD_ECAP_EIM)))
-			return trace_error(-EIO);
-
-		ctrls = mmio_read32(reg_base + VTD_GSTS_REG) &
-			VTD_GSTS_USED_CTRLS;
-		if (ctrls != 0) {
-			if (ctrls != (VTD_GSTS_IRES | VTD_GSTS_QIES))
-				return trace_error(-EBUSY);
-			err = vtd_init_ir_emulation(n, reg_base);
-			if (err)
-				return err;
-		} else if (root_cell.arch.vtd.ir_emulation) {
-			/* IR+QI must be either on or off in all units */
-			return trace_error(-EIO);
-		}
-
-		num_did = 1 << (4 + (caps & VTD_CAP_NUM_DID_MASK) * 2);
-		if (num_did < dmar_num_did)
-			dmar_num_did = num_did;
-	}
-
-	dmar_units = units;
-
-	/*
-	 * Derive vdt_paging from very similar x86_64_paging,
-	 * replicating 0..3 for 4 levels and 1..3 for 3 levels.
-	 */
-	memcpy(vtd_paging, &x86_64_paging[4 - dmar_pt_levels],
-	       sizeof(struct paging) * dmar_pt_levels);
-	for (n = 0; n < dmar_pt_levels; n++)
-		vtd_paging[n].set_next_pt = vtd_set_next_pt;
-	if (!(sllps_caps & VTD_CAP_SLLPS1G))
-		vtd_paging[dmar_pt_levels - 3].page_size = 0;
-	if (!(sllps_caps & VTD_CAP_SLLPS2M))
-		vtd_paging[dmar_pt_levels - 2].page_size = 0;
-
-	return iommu_cell_init(&root_cell);
-}
-
 static void vtd_update_irte(unsigned int index, union vtd_irte content)
 {
 	const struct vtd_entry inv_int = {
@@ -738,8 +597,8 @@ static int vtd_find_int_remap_region(u16 device_id)
 {
 	int n;
 
-	/* interrupt_limit is < 2^16, see vtd_init */
-	for (n = 0; n < system_config->interrupt_limit; n++)
+	/* VTD_INTERRUPT_LIMIT() is < 2^16, see vtd_init */
+	for (n = 0; n < VTD_INTERRUPT_LIMIT(); n++)
 		if (int_remap_table[n].field.assigned &&
 		    int_remap_table[n].field.sid == device_id)
 			return n;
@@ -754,7 +613,7 @@ static int vtd_reserve_int_remap_region(u16 device_id, unsigned int length)
 	if (length == 0 || vtd_find_int_remap_region(device_id) >= 0)
 		return 0;
 
-	for (n = 0; n < system_config->interrupt_limit; n++) {
+	for (n = 0; n < VTD_INTERRUPT_LIMIT(); n++) {
 		if (int_remap_table[n].field.assigned) {
 			start = -E2BIG;
 			continue;
@@ -762,8 +621,9 @@ static int vtd_reserve_int_remap_region(u16 device_id, unsigned int length)
 		if (start < 0)
 			start = n;
 		if (n + 1 == start + length) {
-			printk("Reserving %u interrupt(s) for device %04x "
-			       "at index %d\n", length, device_id, start);
+			printk("Reserving %u interrupt(s) for device "
+			       "%02x:%02x.%x at index %d\n", length,
+			       PCI_BDF_PARAMS(device_id), start);
 			for (n = start; n < start + length; n++) {
 				int_remap_table[n].field.assigned = 1;
 				int_remap_table[n].field.sid = device_id;
@@ -780,8 +640,8 @@ static void vtd_free_int_remap_region(u16 device_id, unsigned int length)
 	int pos = vtd_find_int_remap_region(device_id);
 
 	if (pos >= 0) {
-		printk("Freeing %u interrupt(s) for device %04x at index %d\n",
-		       length, device_id, pos);
+		printk("Freeing %u interrupt(s) for device %02x:%02x.%x at "
+		       "index %d\n", length, PCI_BDF_PARAMS(device_id), pos);
 		while (length-- > 0)
 			vtd_update_irte(pos++, free_irte);
 	}
@@ -795,10 +655,6 @@ int iommu_add_pci_device(struct cell *cell, struct pci_device *device)
 	u64 *root_entry_lo = &root_entry_table[PCI_BUS(bdf)].lo_word;
 	struct vtd_entry *context_entry_table, *context_entry;
 	int result;
-
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return 0;
 
 	result = vtd_reserve_int_remap_region(bdf, max_vectors);
 	if (result < 0)
@@ -821,7 +677,7 @@ int iommu_add_pci_device(struct cell *cell, struct pci_device *device)
 		paging_hvirt2phys(cell->arch.vtd.pg_structs.root_table);
 	context_entry->hi_word =
 		(dmar_pt_levels == 3 ? VTD_CTX_AGAW_39 : VTD_CTX_AGAW_48) |
-		(cell->id << VTD_CTX_DID_SHIFT);
+		(cell->config->id << VTD_CTX_DID_SHIFT);
 	arch_paging_flush_cpu_caches(context_entry, sizeof(*context_entry));
 
 	return 0;
@@ -838,10 +694,6 @@ void iommu_remove_pci_device(struct pci_device *device)
 	struct vtd_entry *context_entry_table;
 	struct vtd_entry *context_entry;
 	unsigned int n;
-
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return;
 
 	vtd_free_int_remap_region(bdf, MAX(device->info->num_msi_vectors,
 					   device->info->num_msix_vectors));
@@ -861,18 +713,17 @@ void iommu_remove_pci_device(struct pci_device *device)
 	page_free(&mem_pool, context_entry_table, 1);
 }
 
-int iommu_cell_init(struct cell *cell)
+static void vtd_cell_exit(struct cell *cell);
+
+static int vtd_cell_init(struct cell *cell)
 {
 	const struct jailhouse_irqchip *irqchip =
 		jailhouse_cell_irqchips(cell->config);
+	struct phys_ioapic *ioapic;
 	unsigned int n;
 	int result;
 
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return 0;
-
-	if (cell->id >= dmar_num_did)
+	if (cell->config->id >= dmar_num_did)
 		return trace_error(-ERANGE);
 
 	cell->arch.vtd.pg_structs.root_paging = vtd_paging;
@@ -882,10 +733,12 @@ int iommu_cell_init(struct cell *cell)
 
 	/* reserve regions for IRQ chips (if not done already) */
 	for (n = 0; n < cell->config->num_irqchips; n++, irqchip++) {
-		result = vtd_reserve_int_remap_region(irqchip->id,
-						      IOAPIC_NUM_PINS);
+		result = ioapic_get_or_add_phys(irqchip, &ioapic);
+		if (result == 0)
+			result = vtd_reserve_int_remap_region(irqchip->id,
+							      ioapic->pins);
 		if (result < 0) {
-			iommu_cell_exit(cell);
+			vtd_cell_exit(cell);
 			return result;
 		}
 	}
@@ -896,11 +749,8 @@ int iommu_cell_init(struct cell *cell)
 int iommu_map_memory_region(struct cell *cell,
 			    const struct jailhouse_memory *mem)
 {
-	u32 flags = 0;
-
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return 0;
+	unsigned long access_flags = 0;
+	unsigned long paging_flags = PAGING_COHERENT | PAGING_HUGE;
 
 	if (!(mem->flags & JAILHOUSE_MEM_DMA))
 		return 0;
@@ -909,22 +759,20 @@ int iommu_map_memory_region(struct cell *cell,
 		return trace_error(-E2BIG);
 
 	if (mem->flags & JAILHOUSE_MEM_READ)
-		flags |= VTD_PAGE_READ;
+		access_flags |= VTD_PAGE_READ;
 	if (mem->flags & JAILHOUSE_MEM_WRITE)
-		flags |= VTD_PAGE_WRITE;
+		access_flags |= VTD_PAGE_WRITE;
+	if (mem->flags & JAILHOUSE_MEM_NO_HUGEPAGES)
+		paging_flags &= ~PAGING_HUGE;
 
 	return paging_create(&cell->arch.vtd.pg_structs, mem->phys_start,
-			     mem->size, mem->virt_start, flags,
-			     PAGING_COHERENT);
+			     mem->size, mem->virt_start, access_flags,
+			     paging_flags);
 }
 
 int iommu_unmap_memory_region(struct cell *cell,
 			      const struct jailhouse_memory *mem)
 {
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return 0;
-
 	if (!(mem->flags & JAILHOUSE_MEM_DMA))
 		return 0;
 
@@ -953,7 +801,8 @@ iommu_get_remapped_root_int(unsigned int iommu, u16 device_id,
 	if (!irte_page)
 		return irq_msg;
 
-	root_irte = *(union vtd_irte *)(irte_page + (irte_addr & ~PAGE_MASK));
+	root_irte = *(union vtd_irte *)(irte_page +
+					(irte_addr & PAGE_OFFS_MASK));
 
 	irq_msg.valid =
 		(root_irte.field.p && root_irte.field.sid == device_id);
@@ -980,16 +829,12 @@ int iommu_map_interrupt(struct cell *cell, u16 device_id, unsigned int vector,
 	union vtd_irte irte;
 	int base_index;
 
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return -ENOSYS;
-
 	base_index = vtd_find_int_remap_region(device_id);
 	if (base_index < 0)
 		return base_index;
 
-	if (vector >= system_config->interrupt_limit ||
-	    base_index >= system_config->interrupt_limit - vector)
+	if (vector >= VTD_INTERRUPT_LIMIT() ||
+	    base_index >= VTD_INTERRUPT_LIMIT() - vector)
 		return -ERANGE;
 
 	irte = int_remap_table[base_index + vector];
@@ -1005,13 +850,16 @@ int iommu_map_interrupt(struct cell *cell, u16 device_id, unsigned int vector,
 		goto update_irte;
 
 	/*
-	 * Validate delivery mode and destination(s).
-	 * Note that we do support redirection hint only in logical
-	 * destination mode.
+	 * If redirection hint is cleared, physical destination mode is used
+	 * effectively (destination mode bit is ignored, only a single CPU is
+	 * targeted). Fix up irq_msg so that apic_filter_irq_dest uses the
+	 * appropriate mode.
 	 */
-	if ((irq_msg.delivery_mode != APIC_MSG_DLVR_FIXED &&
-	     irq_msg.delivery_mode != APIC_MSG_DLVR_LOWPRI) ||
-	    irq_msg.dest_logical != irq_msg.redir_hint)
+	irq_msg.dest_logical = irq_msg.dest_logical && irq_msg.redir_hint;
+
+	/* Validate delivery mode and destination(s). */
+	if (irq_msg.delivery_mode != APIC_MSG_DLVR_FIXED &&
+	    irq_msg.delivery_mode != APIC_MSG_DLVR_LOWPRI)
 		return -EINVAL;
 	if (!apic_filter_irq_dest(cell, &irq_msg))
 		return -EPERM;
@@ -1034,12 +882,8 @@ update_irte:
 	return base_index + vector;
 }
 
-void iommu_cell_exit(struct cell *cell)
+static void vtd_cell_exit(struct cell *cell)
 {
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return;
-
 	page_free(&mem_pool, cell->arch.vtd.pg_structs.root_table, 1);
 
 	/*
@@ -1054,10 +898,6 @@ void iommu_config_commit(struct cell *cell_added_removed)
 	void *reg_base = dmar_reg_base;
 	int n;
 
-	// HACK for QEMU
-	if (dmar_units == 0)
-		return;
-
 	if (cell_added_removed)
 		vtd_init_fault_nmi();
 
@@ -1070,8 +910,8 @@ void iommu_config_commit(struct cell *cell_added_removed)
 		dmar_units_initialized = true;
 	} else {
 		if (cell_added_removed)
-			vtd_flush_domain_caches(cell_added_removed->id);
-		vtd_flush_domain_caches(root_cell.id);
+			vtd_flush_domain_caches(cell_added_removed->config->id);
+		vtd_flush_domain_caches(root_cell.config->id);
 	}
 }
 
@@ -1116,7 +956,151 @@ static void vtd_restore_ir(unsigned int unit_no, void *reg_base)
 			     unit->fault_event_regs[n]);
 }
 
-void iommu_shutdown(void)
+static int vtd_init_ir_emulation(unsigned int unit_no, void *reg_base)
+{
+	struct vtd_emulation *unit = &root_cell_units[unit_no];
+	unsigned long base, size;
+	unsigned int n;
+	u64 iqt;
+
+	root_cell.arch.vtd.ir_emulation = true;
+
+	base = system_config->platform_info.x86.iommu_units[unit_no].base;
+	mmio_region_register(&root_cell, base, PAGE_SIZE,
+			     vtd_unit_access_handler, unit);
+
+	unit->irta = mmio_read64(reg_base + VTD_IRTA_REG);
+	unit->irt_entries = 2 << (unit->irta & VTD_IRTA_SIZE_MASK);
+
+	size = PAGE_ALIGN(sizeof(struct vtd_irte_usage) * unit->irt_entries);
+	unit->irte_map = page_alloc(&mem_pool, size / PAGE_SIZE);
+	if (!unit->irte_map)
+		return -ENOMEM;
+
+	iqt = mmio_read64(reg_base + VTD_IQT_REG);
+	while (mmio_read64(reg_base + VTD_IQH_REG) != iqt)
+		cpu_relax();
+	unit->iqh = iqt;
+
+	unit->iqa = mmio_read64(reg_base + VTD_IQA_REG);
+	if (unit->iqa & ~VTD_IQA_ADDR_MASK)
+		return trace_error(-EIO);
+
+	for (n = 0; n < ARRAY_SIZE(unit->fault_event_regs); n++)
+		unit->fault_event_regs[n] =
+			mmio_read32(reg_base + VTD_FECTL_REG + n * 4);
+
+	return 0;
+}
+
+static int vtd_init(void)
+{
+	unsigned long version, caps, ecaps, ctrls, sllps_caps = ~0UL;
+	unsigned int units, pt_levels, num_did, n;
+	struct jailhouse_iommu *unit;
+	void *reg_base;
+	int err;
+
+	/* n = roundup(log2(VTD_INTERRUPT_LIMIT())) */
+	for (n = 0; (1UL << n) < VTD_INTERRUPT_LIMIT(); n++)
+		; /* empty loop */
+	if (n >= 16)
+		return trace_error(-EINVAL);
+
+	int_remap_table =
+		page_alloc(&mem_pool, PAGES(sizeof(union vtd_irte) << n));
+	if (!int_remap_table)
+		return -ENOMEM;
+
+	int_remap_table_size_log2 = n;
+
+	units = iommu_count_units();
+	if (units == 0)
+		return trace_error(-EINVAL);
+
+	dmar_reg_base = page_alloc(&remap_pool, units * PAGES(DMAR_MMIO_SIZE));
+	if (!dmar_reg_base)
+		return trace_error(-ENOMEM);
+
+	unit_inv_queue = page_alloc(&mem_pool, units);
+	if (!unit_inv_queue)
+		return -ENOMEM;
+
+	for (n = 0; n < units; n++) {
+		unit = &system_config->platform_info.x86.iommu_units[n];
+		if (unit->type != JAILHOUSE_IOMMU_INTEL)
+			return trace_error(-EINVAL);
+
+		reg_base = dmar_reg_base + n * DMAR_MMIO_SIZE;
+
+		err = paging_create(&hv_paging_structs, unit->base, unit->size,
+				    (unsigned long)reg_base,
+				    PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE,
+				    PAGING_NON_COHERENT | PAGING_HUGE);
+		if (err)
+			return err;
+
+		version = mmio_read64(reg_base + VTD_VER_REG) & VTD_VER_MASK;
+		if (version < VTD_VER_MIN || version == 0xff)
+			return trace_error(-EIO);
+
+		printk("DMAR unit @0x%llx/0x%x\n", unit->base, unit->size);
+
+		caps = mmio_read64(reg_base + VTD_CAP_REG);
+		if (caps & VTD_CAP_SAGAW39)
+			pt_levels = 3;
+		else if (caps & VTD_CAP_SAGAW48)
+			pt_levels = 4;
+		else
+			return trace_error(-EIO);
+		sllps_caps &= caps;
+
+		if (dmar_pt_levels > 0 && dmar_pt_levels != pt_levels)
+			return trace_error(-EIO);
+		dmar_pt_levels = pt_levels;
+
+		ecaps = mmio_read64(reg_base + VTD_ECAP_REG);
+		if (!(ecaps & VTD_ECAP_QI) || !(ecaps & VTD_ECAP_IR) ||
+		    (using_x2apic && !(ecaps & VTD_ECAP_EIM)))
+			return trace_error(-EIO);
+
+		ctrls = mmio_read32(reg_base + VTD_GSTS_REG) &
+			VTD_GSTS_USED_CTRLS;
+		if (ctrls != 0) {
+			if (ctrls != (VTD_GSTS_IRES | VTD_GSTS_QIES))
+				return trace_error(-EBUSY);
+			err = vtd_init_ir_emulation(n, reg_base);
+			if (err)
+				return err;
+		} else if (root_cell.arch.vtd.ir_emulation) {
+			/* IR+QI must be either on or off in all units */
+			return trace_error(-EIO);
+		}
+
+		num_did = 1 << (4 + (caps & VTD_CAP_NUM_DID_MASK) * 2);
+		if (num_did < dmar_num_did)
+			dmar_num_did = num_did;
+	}
+
+	dmar_units = units;
+
+	/*
+	 * Derive vdt_paging from very similar x86_64_paging,
+	 * replicating 0..3 for 4 levels and 1..3 for 3 levels.
+	 */
+	memcpy(vtd_paging, &x86_64_paging[4 - dmar_pt_levels],
+	       sizeof(struct paging) * dmar_pt_levels);
+	for (n = 0; n < dmar_pt_levels; n++)
+		vtd_paging[n].set_next_pt = vtd_set_next_pt;
+	if (!(sllps_caps & VTD_CAP_SLLPS1G))
+		vtd_paging[dmar_pt_levels - 3].page_size = 0;
+	if (!(sllps_caps & VTD_CAP_SLLPS2M))
+		vtd_paging[dmar_pt_levels - 2].page_size = 0;
+
+	return vtd_cell_init(&root_cell);
+}
+
+void iommu_prepare_shutdown(void)
 {
 	void *reg_base = dmar_reg_base;
 	unsigned int n;
@@ -1136,3 +1120,6 @@ bool iommu_cell_emulates_ir(struct cell *cell)
 {
 	return cell->arch.vtd.ir_emulation;
 }
+
+DEFINE_UNIT_SHUTDOWN_STUB(vtd);
+DEFINE_UNIT(vtd, "VT-d");

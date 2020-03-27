@@ -22,12 +22,6 @@
 
 #include <inmate.h>
 
-#ifdef CONFIG_UART_OXPCIE952
-#define UART_BASE		0xe000
-#else
-#define UART_BASE		0x2f8
-#endif
-
 #define PM1_STATUS		0
 #define PM1_ENABLE		2
 # define PM1_TMR_EN		(1 << 0)
@@ -38,9 +32,14 @@
 
 static unsigned int pm_base;
 
-static void irq_handler(void)
+static void irq_handler(unsigned int irq)
 {
-	u16 status = inw(pm_base + PM1_STATUS);
+	u16 status;
+
+	if (irq != IRQ_VECTOR)
+		return;
+
+	status = inw(pm_base + PM1_STATUS);
 
 	printk("ACPI IRQ received, status: %04x\n", status);
 	outw(status, pm_base);
@@ -48,10 +47,7 @@ static void irq_handler(void)
 
 void inmate_main(void)
 {
-	printk_uart_base = UART_BASE;
-
-	int_init();
-	int_set_handler(IRQ_VECTOR, irq_handler);
+	irq_init(irq_handler);
 
 	ioapic_init();
 	ioapic_pin_set_vector(ACPI_GSI, TRIGGER_LEVEL_ACTIVE_HIGH, IRQ_VECTOR);
@@ -62,6 +58,5 @@ void inmate_main(void)
 	printk("Note: ACPI IRQs are broken for Linux now.\n");
 	asm volatile("sti");
 
-	while (1)
-		asm volatile("hlt");
+	halt();
 }

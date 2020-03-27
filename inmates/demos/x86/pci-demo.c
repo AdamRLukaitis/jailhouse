@@ -11,17 +11,11 @@
  *
  *
  * Append "-device intel-hda,addr=1b.0 -device hda-output" to the QEMU command
- * line for testing in the virtual machine. Adjust configs/pci-demo.c for real
- * machines as needed.
+ * line for testing in the virtual machine. Adjust configs/x86/pci-demo.c for
+ * real machines as needed.
  */
 
 #include <inmate.h>
-
-#ifdef CONFIG_UART_OXPCIE952
-#define UART_BASE		0xe000
-#else
-#define UART_BASE		0x2f8
-#endif
 
 #define IRQ_VECTOR		32
 
@@ -32,9 +26,14 @@
 
 static void *hdbar;
 
-static void irq_handler(void)
+static void irq_handler(unsigned int irq)
 {
-	u16 statests = mmio_read16(hdbar + HDA_STATESTS);
+	u16 statests;
+
+	if (irq != IRQ_VECTOR)
+		return;
+
+	statests = mmio_read16(hdbar + HDA_STATESTS);
 
 	printk("HDA MSI received (STATESTS: %04x)\n", statests);
 	mmio_write16(hdbar + HDA_STATESTS, statests);
@@ -45,10 +44,7 @@ void inmate_main(void)
 	u64 bar;
 	int bdf;
 
-	printk_uart_base = UART_BASE;
-
-	int_init();
-	int_set_handler(IRQ_VECTOR, irq_handler);
+	irq_init(irq_handler);
 
 	bdf = pci_find_device(PCI_ID_ANY, PCI_ID_ANY, 0);
 	if (bdf < 0) {
@@ -83,6 +79,5 @@ void inmate_main(void)
 	mmio_write16(hdbar + HDA_WAKEEN, 0x0f);
 	mmio_write32(hdbar + HDA_INTCTL, (1 << 31) | (1 << 30));
 
-	while (1)
-		asm volatile("hlt");
+	halt();
 }

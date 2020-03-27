@@ -18,13 +18,22 @@
 #include <jailhouse/control.h>
 #include <jailhouse/mmio.h>
 #include <asm/apic.h>
-#include <asm/bitops.h>
 #include <asm/control.h>
 
 #define XAPIC_REG(x2apic_reg)		((x2apic_reg) << 4)
 
+ /**
+  * Modern x86 processors are equipped with a local APIC that handles delivery
+  * of external interrupts. The APIC can work in two modes:
+  * - xAPIC: programmed via memory mapped I/O (MMIO)
+  * - x2APIC: programmed throughs model-specific registers (MSRs)
+  */
 bool using_x2apic;
-u8 apic_to_cpu_id[] = { [0 ... APIC_MAX_PHYS_ID] = CPU_ID_INVALID };
+
+/**
+ * Mapping from a physical APIC ID to the logical CPU ID as used by Jailhouse.
+ */
+static u8 apic_to_cpu_id[] = { [0 ... APIC_MAX_PHYS_ID] = CPU_ID_INVALID };
 
 /* Initialized for x2APIC, adjusted for xAPIC during init */
 static u32 apic_reserved_bits[] = {
@@ -35,13 +44,13 @@ static u32 apic_reserved_bits[] = {
 	[0x0c ... 0x0e] = -1,
 	[0x0f]          = 0xfffffc00,	/* SVR */
 	[0x10 ... 0x2e] = -1,
-	[0x2f]          = 0xfffef800,	/* CMCI */
+	[0x2f]          = 0xfffee800,	/* CMCI */
 	[0x30]          = 0xfff33000,	/* ICR (0..31) */
 	[0x31]          = -1,
-	[0x32]          = 0xfff8ff00,	/* Timer */
-	[0x33 ... 0x34] = 0xfffef800,	/* Thermal, Perf */
-	[0x35 ... 0x36] = 0xfff0f800,	/* LINT0, LINT1 */
-	[0x37]          = 0xfffeff00,	/* Error */
+	[0x32]          = 0xfff8ef00,	/* Timer */
+	[0x33 ... 0x34] = 0xfffee800,	/* Thermal, Perf */
+	[0x35 ... 0x36] = 0xfff0e800,	/* LINT0, LINT1 */
+	[0x37]          = 0xfffeef00,	/* Error */
 	[0x38]		= 0,		/* Initial Counter */
 	[0x39 ... 0x3d] = -1,
 	[0x3e]		= 0xfffffff4,	/* DCR */
@@ -56,6 +65,9 @@ static struct {
 	void (*write)(unsigned int reg, u32 val);
 	void (*send_ipi)(u32 apic_id, u32 icr_lo);
 } apic_ops;
+
+void arch_send_event(struct public_per_cpu *target_data)
+	__attribute__((alias("apic_send_nmi_ipi")));
 
 static u32 read_xapic(unsigned int reg)
 {
@@ -112,7 +124,7 @@ static u32 apic_ext_features(void)
 		return 0;
 }
 
-int phys_processor_id(void)
+unsigned long phys_processor_id(void)
 {
 	return apic_ops.read_id();
 }
@@ -121,8 +133,8 @@ int apic_cpu_init(struct per_cpu *cpu_data)
 {
 	unsigned int xlc = MAX((apic_ext_features() >> 16) & 0xff,
 			       APIC_REG_XLVT3 - APIC_REG_XLVT0 + 1);
-	unsigned int apic_id = phys_processor_id();
-	unsigned int cpu_id = cpu_data->cpu_id;
+	unsigned int apic_id = (unsigned int)phys_processor_id();
+	unsigned int cpu_id = cpu_data->public.cpu_id;
 	unsigned int n;
 	u32 ldr;
 
@@ -141,9 +153,9 @@ int apic_cpu_init(struct per_cpu *cpu_data)
 	}
 
 	apic_to_cpu_id[apic_id] = cpu_id;
-	cpu_data->apic_id = apic_id;
+	cpu_data->public.apic_id = apic_id;
 
-	cpu_data->sipi_vector = -1;
+	cpu_data->public.sipi_vector = -1;
 
 	/*
 	 * Extended APIC Register Space (currently, AMD thus xAPIC only).
@@ -161,24 +173,22 @@ int apic_cpu_init(struct per_cpu *cpu_data)
 int apic_init(void)
 {
 	unsigned long apicbase = read_msr(MSR_IA32_APICBASE);
-	int err;
+	u8 apic_mode = system_config->platform_info.x86.apic_mode;
 
-	if (apicbase & APIC_BASE_EXTD) {
+	if (apicbase & APIC_BASE_EXTD &&
+	    apic_mode != JAILHOUSE_APIC_MODE_XAPIC) {
+		/* x2APIC mode */
 		apic_ops.read = read_x2apic;
 		apic_ops.read_id = read_x2apic_id;
 		apic_ops.write = write_x2apic;
 		apic_ops.send_ipi = send_x2apic_ipi;
 		using_x2apic = true;
-	} else if (apicbase & APIC_BASE_EN) {
-		xapic_page = page_alloc(&remap_pool, 1);
+	} else if (apicbase & APIC_BASE_EN &&
+		   apic_mode != JAILHOUSE_APIC_MODE_X2APIC) {
+		/* xAPIC mode */
+		xapic_page = paging_map_device(XAPIC_BASE, PAGE_SIZE);
 		if (!xapic_page)
-			return trace_error(-ENOMEM);
-		err = paging_create(&hv_paging_structs, XAPIC_BASE, PAGE_SIZE,
-				    (unsigned long)xapic_page,
-				    PAGE_DEFAULT_FLAGS | PAGE_FLAG_DEVICE,
-				    PAGING_NON_COHERENT);
-		if (err)
-			return err;
+			return -ENOMEM;
 		apic_ops.read = read_xapic;
 		apic_ops.read_id = read_xapic_id;
 		apic_ops.write = write_xapic;
@@ -198,7 +208,7 @@ int apic_init(void)
 	return 0;
 }
 
-void apic_send_nmi_ipi(struct per_cpu *target_data)
+void apic_send_nmi_ipi(struct public_per_cpu *target_data)
 {
 	apic_ops.send_ipi(target_data->apic_id,
 			  APIC_ICR_DLVR_NMI |
@@ -332,33 +342,6 @@ void apic_clear(void)
 	apic_ops.write(APIC_REG_SVR, 0xff);
 }
 
-static bool apic_valid_ipi_mode(u32 lo_val)
-{
-	switch (lo_val & APIC_ICR_DLVR_MASK) {
-	case APIC_ICR_DLVR_INIT:
-	case APIC_ICR_DLVR_FIXED:
-	case APIC_ICR_DLVR_LOWPRI:
-	case APIC_ICR_DLVR_NMI:
-	case APIC_ICR_DLVR_SIPI:
-		break;
-	default:
-		panic_printk("FATAL: Unsupported APIC delivery mode, "
-			     "ICR.lo=%x\n", lo_val);
-		return false;
-	}
-
-	switch (lo_val & APIC_ICR_SH_MASK) {
-	case APIC_ICR_SH_NONE:
-	case APIC_ICR_SH_SELF:
-		break;
-	default:
-		panic_printk("FATAL: Unsupported shorthand, ICR.lo=%x\n",
-			     lo_val);
-		return false;
-	}
-	return true;
-}
-
 static void apic_send_ipi(unsigned int target_cpu_id, u32 orig_icr_hi,
 			  u32 icr_lo)
 {
@@ -371,8 +354,11 @@ static void apic_send_ipi(unsigned int target_cpu_id, u32 orig_icr_hi,
 
 	switch (icr_lo & APIC_ICR_DLVR_MASK) {
 	case APIC_ICR_DLVR_NMI:
-		/* TODO: must be sent via hypervisor */
-		printk("Ignoring NMI IPI\n");
+		/*
+		 * Correctly virtualized NMI injection is a non-trivial task,
+		 * specifically on AMD. Therefore, we ignore NMI IPIs for now.
+		 */
+		printk("Ignoring NMI IPI to CPU %d\n", target_cpu_id);
 		break;
 	case APIC_ICR_DLVR_INIT:
 		x86_send_init_sipi(target_cpu_id, X86_INIT, -1);
@@ -382,7 +368,8 @@ static void apic_send_ipi(unsigned int target_cpu_id, u32 orig_icr_hi,
 				   icr_lo & APIC_ICR_VECTOR_MASK);
 		break;
 	default:
-		apic_ops.send_ipi(per_cpu(target_cpu_id)->apic_id, icr_lo);
+		apic_ops.send_ipi(public_per_cpu(target_cpu_id)->apic_id,
+				  icr_lo);
 	}
 }
 
@@ -415,6 +402,17 @@ static void apic_send_logical_dest_ipi(u32 lo_val, u32 hi_val)
 		}
 }
 
+static void apic_send_ipi_all(u32 lo_val, int except_cpu)
+{
+	unsigned int cpu;
+
+	/* This implicitly selects APIC_ICR_SH_NONE. */
+	lo_val &= APIC_ICR_LVTM_MASK | APIC_ICR_DLVR_MASK |
+		  APIC_ICR_VECTOR_MASK;
+	for_each_cpu_except(cpu, this_cell()->cpu_set, except_cpu)
+		apic_send_ipi(cpu, 0, lo_val);
+}
+
 /**
  * Handle ICR write request.
  * @param lo_val	Lower 32 bits of ICR
@@ -424,16 +422,35 @@ static void apic_send_logical_dest_ipi(u32 lo_val, u32 hi_val)
  */
 static bool apic_handle_icr_write(u32 lo_val, u32 hi_val)
 {
+	u32 shorthand = lo_val & APIC_ICR_SH_MASK;
 	unsigned int target_cpu_id;
 
-	if (!apic_valid_ipi_mode(lo_val))
+	switch (lo_val & APIC_ICR_DLVR_MASK) {
+	case APIC_ICR_DLVR_FIXED:
+		break;
+	case APIC_ICR_DLVR_INIT:
+	case APIC_ICR_DLVR_LOWPRI:
+	case APIC_ICR_DLVR_NMI:
+	case APIC_ICR_DLVR_SIPI:
+		if (shorthand == APIC_ICR_SH_NONE ||
+		    shorthand == APIC_ICR_SH_ALLOTHER)
+			break;
+		/* fall through */
+	default:
+		panic_printk("FATAL: Unsupported/invalid APIC delivery mode, "
+			     "ICR.lo=%x\n", lo_val);
 		return false;
+	}
 
-	if ((lo_val & APIC_ICR_SH_MASK) == APIC_ICR_SH_SELF) {
-		apic_ops.write(APIC_REG_ICR, (lo_val & APIC_ICR_VECTOR_MASK) |
-					     APIC_ICR_DLVR_FIXED |
-					     APIC_ICR_TM_EDGE |
-					     APIC_ICR_SH_SELF);
+	switch (shorthand) {
+	case APIC_ICR_SH_SELF:
+		apic_ops.write(APIC_REG_ICR, lo_val);
+		return true;
+	case APIC_ICR_SH_ALL:
+		apic_send_ipi_all(lo_val, -1);
+		return true;
+	case APIC_ICR_SH_ALLOTHER:
+		apic_send_ipi_all(lo_val, this_cpu_id());
 		return true;
 	}
 
@@ -475,8 +492,7 @@ static bool apic_invalid_lvt_delivery_mode(unsigned int reg, u32 val)
 	return true;
 }
 
-unsigned int apic_mmio_access(unsigned long rip,
-			      const struct guest_paging_structures *pg_structs,
+unsigned int apic_mmio_access(const struct guest_paging_structures *pg_structs,
 			      unsigned int reg, bool is_write)
 {
 	struct mmio_instruction inst;
@@ -487,7 +503,7 @@ unsigned int apic_mmio_access(unsigned long rip,
 		return 0;
 	}
 
-	inst = x86_mmio_parse(rip, pg_structs, is_write);
+	inst = x86_mmio_parse(pg_structs, is_write);
 	if (inst.inst_len == 0)
 		return 0;
 	if (inst.access_size != 4) {
@@ -496,7 +512,8 @@ unsigned int apic_mmio_access(unsigned long rip,
 		return 0;
 	}
 	if (is_write) {
-		val = this_cpu_data()->guest_regs.by_index[inst.reg_num];
+		val = inst.out_val;
+
 		if (apic_accessing_reserved_bits(reg, val))
 			return 0;
 
@@ -505,7 +522,7 @@ unsigned int apic_mmio_access(unsigned long rip,
 			if (!apic_handle_icr_write(val, dest))
 				return 0;
 		} else if (reg == APIC_REG_LDR &&
-			 val != 1UL << (this_cpu_id() + XAPIC_DEST_SHIFT)) {
+			   val != 1UL << (this_cpu_id() + XAPIC_DEST_SHIFT)) {
 			panic_printk("FATAL: Unsupported change to LDR: %x\n",
 				     val);
 			return 0;
@@ -523,7 +540,7 @@ unsigned int apic_mmio_access(unsigned long rip,
 			apic_ops.write(reg, val);
 	} else {
 		val = apic_ops.read(reg);
-		this_cpu_data()->guest_regs.by_index[inst.reg_num] = val;
+		this_cpu_data()->guest_regs.by_index[inst.in_reg_num] = val;
 	}
 	return inst.inst_len;
 }
@@ -531,17 +548,23 @@ unsigned int apic_mmio_access(unsigned long rip,
 bool x2apic_handle_write(void)
 {
 	union registers *guest_regs = &this_cpu_data()->guest_regs;
+	u32 *stats = this_cpu_public()->stats;
 	u32 reg = guest_regs->rcx - MSR_X2APIC_BASE;
 	u32 val = guest_regs->rax;
 
 	if (apic_accessing_reserved_bits(reg, val))
 		return false;
 
+	if (reg == APIC_REG_ICR) {
+		stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR_X2APIC_ICR]++;
+		return apic_handle_icr_write(val, guest_regs->rdx);
+	}
+
+	stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR_OTHER]++;
+
 	if (reg == APIC_REG_SELF_IPI)
 		/* TODO: emulate */
 		printk("Unhandled x2APIC self IPI write\n");
-	else if (reg == APIC_REG_ICR)
-		return apic_handle_icr_write(val, guest_regs->rdx);
 	else if (reg >= APIC_REG_LVTCMCI && reg <= APIC_REG_LVTERR &&
 		 apic_invalid_lvt_delivery_mode(reg, val))
 		return false;
@@ -555,15 +578,20 @@ void x2apic_handle_read(void)
 {
 	union registers *guest_regs = &this_cpu_data()->guest_regs;
 	u32 reg = guest_regs->rcx - MSR_X2APIC_BASE;
+	u32 *stats = this_cpu_public()->stats;
 
 	if (reg == APIC_REG_ID)
 		guest_regs->rax = apic_ops.read_id();
 	else
 		guest_regs->rax = apic_ops.read(reg);
 
-	guest_regs->rdx = 0;
-	if (reg == APIC_REG_ICR)
+	if (reg == APIC_REG_ICR) {
+		stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR_X2APIC_ICR]++;
 		guest_regs->rdx = apic_ops.read(reg + 1);
+	} else {
+		stats[JAILHOUSE_CPU_STAT_VMEXITS_MSR_OTHER]++;
+		guest_regs->rdx = 0;
+	}
 }
 
 /**

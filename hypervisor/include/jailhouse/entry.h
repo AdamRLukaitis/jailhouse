@@ -77,15 +77,6 @@ int arch_entry(unsigned int cpu_id);
 int entry(unsigned int cpu_id, struct per_cpu *cpu_data);
 
 /**
- * Map the root cell's memory regions.
- *
- * @return 0 on success, negative error code otherwise.
- *
- * Invoked by the architecture-specific setup code.
- */
-int map_root_memory_regions(void);
-
-/**
  * Perform architecture-specific early setup steps.
  *
  * @return 0 on success, negative error code otherwise.
@@ -104,34 +95,23 @@ int arch_init_early(void);
 int arch_cpu_init(struct per_cpu *cpu_data);
 
 /**
- * Perform architecture-specific late setup steps.
- *
- * @return 0 on success, negative error code otherwise.
- *
- * @note This is called over the master CPU that performs CPU-unrelated setup
- * steps.
- */
-int arch_init_late(void);
-
-/**
  * Perform architecture-specific activation of the hypervisor mode.
- * @param cpu_data	Data structure of the calling CPU.
  *
  * @note This function does not return to the caller but rather resumes Linux
  * in guest mode at the point arch_entry() would return to.
  */
-void __attribute__((noreturn)) arch_cpu_activate_vmm(struct per_cpu *cpu_data);
+void __attribute__((noreturn)) arch_cpu_activate_vmm(void);
 
 /**
  * Perform architecture-specific restoration of the CPU state on setup
  * failures or after disabling the hypervisor.
- * @param cpu_data	Data structure of the calling CPU.
+ * @param cpu_id	ID of the calling CPU.
  * @param return_code	Return value to pass to Linux.
  *
  * @note Depending on the architectural implementation, this function may not
  * return to the caller but rather jump to the target Linux context.
  */
-void arch_cpu_restore(struct per_cpu *cpu_data, int return_code);
+void arch_cpu_restore(unsigned int cpu_id, int return_code);
 
 /** @} */
 #endif /* !_JAILHOUSE_ENTRY_H */

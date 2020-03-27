@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2014-2016
+ * Copyright (c) Siemens AG, 2014-2017
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
@@ -39,57 +39,78 @@
  *       "memmap=${hex(ourmem[1])}$${hex(ourmem[0])}"
  */
 
-#include <linux/types.h>
+#include <jailhouse/types.h>
 #include <jailhouse/cell-config.h>
-
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 struct {
 	struct jailhouse_system header;
 	__u64 cpus[${int((cpucount + 63) / 64)}];
-	struct jailhouse_memory mem_regions[${len(regions)}];
+	struct jailhouse_memory mem_regions[${len(mem_regions)}];
 	struct jailhouse_irqchip irqchips[${len(irqchips)}];
-	__u8 pio_bitmap[0x2000];
+	struct jailhouse_pio pio_regions[${len([1 for r in port_regions if r.permit])}];
 	struct jailhouse_pci_device pci_devices[${len(pcidevices)}];
 	struct jailhouse_pci_capability pci_caps[${len(pcicaps)}];
 } __attribute__((packed)) config = {
 	.header = {
 		.signature = JAILHOUSE_SYSTEM_SIGNATURE,
+		.revision = JAILHOUSE_CONFIG_REVISION,
+		.flags = JAILHOUSE_SYS_VIRTUAL_DEBUG_CONSOLE,
 		.hypervisor_memory = {
 			.phys_start = ${hex(hvmem[0])},
 			.size = ${hex(hvmem[1])},
 		},
 		.debug_console = {
-			.phys_start = 0x3f8,
-		},
-		.platform_info.x86 = {
-			.mmconfig_base = ${hex(mmconfig.base)},
-			.mmconfig_end_bus = ${hex(mmconfig.end_bus)},
-			.pm_timer_address = ${hex(pm_timer_base)},
-			% if iommu_units:
-			.iommu_units = {
-				% for unit in iommu_units:
-				{
-					.base = ${hex(unit.base_addr)},
-					.size = ${hex(unit.mmio_size)},
-					% if unit.is_amd_iommu:
-					.amd_bdf = ${hex(unit.amd_bdf)},
-					.amd_base_cap = ${hex(unit.amd_base_cap)},
-					.amd_msi_cap = ${hex(unit.amd_msi_cap)},
-					.amd_features = ${hex(unit.amd_features)},
-				        % endif
-				},
-				% endfor
-			},
+			% if debug_console.address != 0:
+			.address = ${hex(debug_console.address)},
+			.type = JAILHOUSE_CON_TYPE_8250,
+			% if not debug_console.pio:
+			.size = 0x1000,
+			% endif
+			% if debug_console.pio:
+			.flags = JAILHOUSE_CON_ACCESS_PIO |
+			% else:
+			.flags = JAILHOUSE_CON_ACCESS_MMIO |
+			% endif
+			% if debug_console.dist1:
+				 JAILHOUSE_CON_REGDIST_1,
+			% else:
+				 JAILHOUSE_CON_REGDIST_4,
+			% endif
+			% else:
+			.type = JAILHOUSE_CON_TYPE_NONE,
 			% endif
 		},
-		.interrupt_limit = 256,
+		.platform_info = {
+			.pci_mmconfig_base = ${hex(mmconfig.base)},
+			.pci_mmconfig_end_bus = ${hex(mmconfig.end_bus)},
+			.x86 = {
+				.pm_timer_address = ${hex(pm_timer_base)},
+				.vtd_interrupt_limit = ${int(vtd_interrupt_limit)},
+				% if iommu_units:
+				.iommu_units = {
+					% for unit in iommu_units:
+					{
+						.type = ${unit.type},
+						.base = ${hex(unit.base_addr)},
+						.size = ${hex(unit.mmio_size)},
+						% if unit.is_amd_iommu:
+						.amd.bdf = ${hex(unit.amd_bdf)},
+						.amd.base_cap = ${hex(unit.amd_base_cap)},
+						.amd.msi_cap = ${hex(unit.amd_msi_cap)},
+						.amd.features = ${hex(unit.amd_features)},
+						% endif
+					},
+					% endfor
+				},
+				% endif
+			},
+		},
 		.root_cell = {
 			.name = "RootCell",
 			.cpu_set_size = sizeof(config.cpus),
 			.num_memory_regions = ARRAY_SIZE(config.mem_regions),
 			.num_irqchips = ARRAY_SIZE(config.irqchips),
-			.pio_bitmap_size = ARRAY_SIZE(config.pio_bitmap),
+			.num_pio_regions = ARRAY_SIZE(config.pio_regions),
 			.num_pci_devices = ARRAY_SIZE(config.pci_devices),
 			.num_pci_caps = ARRAY_SIZE(config.pci_caps),
 		},
@@ -105,15 +126,15 @@ struct {
 	},
 
 	.mem_regions = {
-		% for r in regions:
+		% for r in mem_regions:
 		/* ${str(r)} */
 		% for c in r.comments:
 		/* ${c} */
 		% endfor
 		{
-			.phys_start = ${hex(r.start).strip('L')},
-			.virt_start = ${hex(r.start).strip('L')},
-			.size = ${hex(r.size()).strip('L')},
+			.phys_start = ${r.start_str()},
+			.virt_start = ${r.start_str()},
+			.size = ${r.size_str()},
 			.flags = ${r.flagstr('\t\t')},
 		},
 		% endfor
@@ -125,24 +146,18 @@ struct {
 		{
 			.address = ${hex(i.address)},
 			.id = ${hex(i.irqchip_id())},
-			.pin_bitmap = 0xffffff,
+			.pin_bitmap = {
+				0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff
+			},
 		},
 		% endfor
 	},
 
-	.pio_bitmap = {
-		[     0/8 ...   0x3f/8] = -1,
-		[  0x40/8 ...   0x47/8] = 0xf0, /* PIT */
-		[  0x48/8 ...   0x5f/8] = -1,
-		[  0x60/8 ...   0x67/8] = 0xec, /* HACK: NMI status/control */
-		[  0x68/8 ...   0x6f/8] = -1,
-		[  0x70/8 ...   0x77/8] = 0xfc, /* RTC */
-		[  0x78/8 ...   0x7f/8] = -1,
-		[  0x80/8 ...   0x87/8] = 0xfe, /* Linux: native_io_delay() */
-		[  0x88/8 ...  0x3af/8] = -1,
-		[ 0x3b0/8 ...  0x3df/8] = 0x00, /* VGA */
-		[ 0x3e0/8 ...  0xcff/8] = -1,
-		[ 0xd00/8 ... 0xffff/8] = 0, /* HACK: PCI bus */
+	.pio_regions = {
+		% for r in port_regions:
+		/* ${str(r)} */
+		${'' if r.permit else '/* '}PIO_RANGE(${r.start_str()}, ${r.size_str()}),${'' if r.permit else ' */'}
+		% endfor
 	},
 
 	.pci_devices = {
@@ -163,6 +178,7 @@ struct {
 			.num_caps = ${d.num_caps},
 			.num_msi_vectors = ${d.num_msi_vectors},
 			.msi_64bits = ${d.msi_64bits},
+			.msi_maskable = ${d.msi_maskable},
 			.num_msix_vectors = ${d.num_msix_vectors},
 			.msix_region_size = ${hex(d.msix_region_size)},
 			.msix_address = ${hex(d.msix_address).strip('L')},
@@ -176,13 +192,9 @@ struct {
 		/* ${comment} */
 		% endfor
 		{
-			% if (c.id & 0x8000) != 0:
-			.id = ${hex(c.id & 0x7fff)} | JAILHOUSE_PCI_EXT_CAP,
-			% else:
-			.id = ${hex(c.id)},
-			% endif
+			.id = ${c.gen_id_str()},
 			.start = ${hex(c.start)},
-			.len = ${c.len},
+			.len = ${hex(c.len)},
 			.flags = ${c.flags},
 		},
 		% endfor

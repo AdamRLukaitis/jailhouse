@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2014-2015
+ * Copyright (c) Siemens AG, 2014-2016
  *
  * Authors:
  *  Jan Kiszka <jan.kiszka@siemens.com>
@@ -24,8 +24,11 @@
 
 struct cell {
 	struct kobject kobj;
+	struct kobject stats_kobj;
+	struct list_head cell_cpus;
 	struct list_head entry;
 	unsigned int id;
+	char name[JAILHOUSE_CELL_ID_NAMELEN+1];
 	cpumask_t cpus_assigned;
 	u32 num_memory_regions;
 	struct jailhouse_memory *memory_regions;
@@ -39,20 +42,15 @@ extern struct cell *root_cell;
 
 void jailhouse_cell_kobj_release(struct kobject *kobj);
 
-struct cell *
-jailhouse_cell_create(const struct jailhouse_cell_desc *cell_desc);
-void jailhouse_cell_register(struct cell *cell);
-void jailhouse_cell_delete(struct cell *cell);
-
 int jailhouse_cell_prepare_root(const struct jailhouse_cell_desc *cell_desc);
 void jailhouse_cell_register_root(void);
 void jailhouse_cell_delete_root(void);
-
-void jailhouse_cell_delete_all(void);
 
 int jailhouse_cmd_cell_create(struct jailhouse_cell_create __user *arg);
 int jailhouse_cmd_cell_load(struct jailhouse_cell_load __user *arg);
 int jailhouse_cmd_cell_start(const char __user *arg);
 int jailhouse_cmd_cell_destroy(const char __user *arg);
+
+int jailhouse_cmd_cell_destroy_non_root(void);
 
 #endif /* !_JAILHOUSE_DRIVER_CELL_H */
